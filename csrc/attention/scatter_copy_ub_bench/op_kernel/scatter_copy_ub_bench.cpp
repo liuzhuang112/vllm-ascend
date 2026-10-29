@@ -91,6 +91,11 @@ public:
         // group's rows stay adjacent and remain coalescible.
         groups_ = CeilDiv(totalGroups_ - coreIdx_, static_cast<int64_t>(usedCoreNum_));
 
+        // Fetched once per launch, not once per group: the id is reused by a
+        // serially executed SetFlag/WaitFlag pair, so a single id is enough and
+        // the event pool is never churned.
+        writeDoneEvent_ = static_cast<event_t>(pipe_->FetchEventID(HardEvent::MTE3_MTE2));
+
         const int64_t lookahead = static_cast<int64_t>(bankNum_) - 1;
         for (int64_t k = 0; k < lookahead && k < groups_; ++k) {
             CopyIn(static_cast<uint32_t>(k), GroupOf(k));
@@ -171,7 +176,9 @@ private:
         // this repo initialises it explicitly for the same reason.
         DataCopyPadExtParams<T> padParams{false, static_cast<uint8_t>(0), static_cast<uint8_t>(0),
                                           static_cast<T>(0)};
-        DataCopyExtParams params;
+        // Zero-initialised as well: every field is overwritten below, but an
+        // aggregate init keeps any member a future CANN version adds at zero.
+        DataCopyExtParams params{1, 0, 0, 0};
         params.blockCount = 1;
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
         params.srcStride = 0;
@@ -203,7 +210,7 @@ private:
     __aicore__ inline void CopyOut(uint32_t slot)
     {
         LocalTensor<T> local = copyQueue_.template DeQue<T>();
-        DataCopyExtParams params;
+        DataCopyExtParams params{1, 0, 0, 0};
         params.blockCount = 1;
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
         params.srcStride = 0;
@@ -233,9 +240,8 @@ private:
         // MTE3 drains the bank asynchronously, so the queue must not hand the
         // buffer back to MTE2 before the store retires. This is the fence the
         // production A5 copy paths use before they release a VECIN buffer.
-        const auto writeDone = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
-        SetFlag<HardEvent::MTE3_MTE2>(writeDone);
-        WaitFlag<HardEvent::MTE3_MTE2>(writeDone);
+        SetFlag<HardEvent::MTE3_MTE2>(writeDoneEvent_);
+        WaitFlag<HardEvent::MTE3_MTE2>(writeDoneEvent_);
         copyQueue_.FreeTensor(local);
     }
 
@@ -262,6 +268,7 @@ private:
     int64_t tableMode_ = 0;
     uint32_t bankNum_ = 2;
     uint32_t usedCoreNum_ = 1;
+    event_t writeDoneEvent_ = static_cast<event_t>(EVENT_ID0);
 
     // Destination rows of each in-flight group, plus the two coalescing
     // decisions. This is the only scalar state the pipeline carries.
