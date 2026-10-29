@@ -15,7 +15,8 @@ cache layout, so the per-token cost is two DataCopyPad calls per direction.
 Source placement decides what is being measured:
 
     --src npu    source lives in HBM       -> HBM to HBM ceiling
-    --src host   source is a pinned host view published to the device
+    --src host   source is host memory registered with aclrtHostRegisterV2
+                 and published by aclrtHostGetDevicePointer
                                                -> real DRAM to HBM transfer
 
 Examples:
@@ -60,9 +61,11 @@ a still-missing op then really does mean a stale ``vllm_ascend_C``.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import statistics
 import sys
 from dataclasses import dataclass
+from functools import cache
 
 import torch
 
@@ -73,6 +76,13 @@ CKV_DIM = 512
 KPE_DIM = 64
 ROW_BYTES_PER_ELEM = CKV_DIM + KPE_DIM  # elements copied per token
 OP_NAME = "scatter_copy_ub_bench"
+# ``torch.pin_memory()`` only locks pages; it does not publish the range to the
+# device. ``aclrtHostRegisterV2`` does, and the payload is then aligned to this
+# boundary -- engram/npu.py aligns to 64 KiB because unaligned device reads of a
+# host range were observed to return wrong data on A3 / CANN 9.2.
+HOST_ALIGN_BYTES = 64 * 1024
+ACL_HOST_REG_MAPPED = 0x2
+ACL_HOST_REG_PINNED = 0x10000000
 REBUILD_BINDING = (
     "  build the torch binding; the kernel package alone does not register it:\n"
     "    SOC_VERSION=<soc> VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \\\n"
@@ -198,6 +208,34 @@ def _load_runtime():
     _warn_if_kernel_package_missing()
 
 
+@cache
+def _acl_runtime() -> ctypes.CDLL:
+    """The CANN entry points that publish host memory to the device."""
+    lib = ctypes.CDLL("libascendcl.so")
+    lib.aclrtHostRegisterV2.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32]
+    lib.aclrtHostRegisterV2.restype = ctypes.c_int
+    lib.aclrtHostGetDevicePointer.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
+    lib.aclrtHostGetDevicePointer.restype = ctypes.c_int
+    lib.aclrtHostUnregister.argtypes = [ctypes.c_void_p]
+    lib.aclrtHostUnregister.restype = ctypes.c_int
+    return lib
+
+
+def _host_register_flags() -> int:
+    """Flags this SoC accepts in ``aclrtHostRegisterV2``.
+
+    A5 rejects the PINNED hint with error 107000 (device_op.py says so
+    explicitly), so ask the device adaptor rather than hard-coding:
+    MAPPED on A5, MAPPED|PINNED elsewhere.
+    """
+    try:
+        from vllm_ascend.device.device_op import DeviceOperator
+
+        return DeviceOperator.host_register_flags()
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return ACL_HOST_REG_MAPPED
+
+
 @dataclass
 class Case:
     rows: int
@@ -215,6 +253,7 @@ class Bench:
     def __init__(self, case: Case, seed: int = 0) -> None:
         self.case = case
         self.device = torch.device("npu:0")
+        self._host_regions: list[tuple[int, int, torch.Tensor]] = []
         gen = torch.Generator().manual_seed(seed)
         rows = case.rows
 
@@ -245,16 +284,73 @@ class Bench:
             return values.to(self.device), None
         if self.case.src != "host":
             raise ValueError(f"unknown source placement: {self.case.src}")
-        # Pinned host memory is registered by the torch_npu host allocator, so
-        # the device address is the mapped view rather than the CPU pointer.
-        host = values.pin_memory()
-        view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(host)
-        if view is None:
+        return self._publish_host_source(values, rows, dim)
+
+    def _publish_host_source(self, values: torch.Tensor, rows: int, dim: int):
+        """Return (device view, host copy) of a host buffer the NPU can read.
+
+        ``pin_memory()`` alone is not enough: ``get_npu_view_from_cpu_tensor``
+        calls ``aclrtHostGetDevicePointer``, which only succeeds for a range
+        allocated by ``aclrtMallocHost`` or registered with
+        ``aclrtHostRegisterV2(ACL_HOST_REG_MAPPED)``. A merely pinned buffer
+        therefore comes back as ``None``. This mirrors
+        ``vllm_ascend/models/deepseek_v41/engram/npu.py::HostUvaBuffer``, which
+        is the way this repo publishes host memory to the device.
+        """
+        elt = values.element_size()
+        # Over-allocate so the payload starts on a 64 KiB boundary. The whole
+        # storage is registered, so the view's storage_offset stays reachable
+        # and aclrtHostGetDevicePointer(storage base) remains valid.
+        slack = HOST_ALIGN_BYTES // elt
+        raw = torch.empty(rows * dim + slack, dtype=self.case.dtype, pin_memory=True)
+        if not raw.is_pinned():
             raise SystemExit(
-                "get_npu_view_from_cpu_tensor returned None: the host buffer is "
-                "not registered for device access."
+                "torch pin_memory() returned an ordinary CPU buffer, so this "
+                "buffer cannot be published to the device. Check the torch_npu "
+                "pinned allocator on this machine, or run without --src host."
             )
-        return view, host
+        offset = ((-raw.data_ptr()) % HOST_ALIGN_BYTES) // elt
+        payload = raw.narrow(0, offset, rows * dim).view(rows, dim)
+        payload.copy_(values)
+
+        lib = _acl_runtime()
+        flags = _host_register_flags()
+        base = raw.data_ptr()
+        size = raw.numel() * elt
+        rc = lib.aclrtHostRegisterV2(ctypes.c_void_p(base), size, flags)
+        if rc == 0:
+            self._host_regions.append((base, size, raw))
+
+        view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(payload)
+        if view is None:
+            dev_ptr = ctypes.c_void_p()
+            rc_dev = lib.aclrtHostGetDevicePointer(ctypes.c_void_p(payload.data_ptr()),
+                                                   ctypes.byref(dev_ptr), 0)
+            if rc == 0:
+                lib.aclrtHostUnregister(ctypes.c_void_p(base))
+                self._host_regions.clear()
+            raise SystemExit(
+                "the host source could not be published to the device:\n"
+                f"  aclrtHostRegisterV2 rc={rc} flags=0x{flags:x}\n"
+                f"  aclrtHostGetDevicePointer rc={rc_dev}\n"
+                "  on A5 only ACL_HOST_REG_MAPPED is accepted (PINNED fails with "
+                "107000); DeviceOperator.host_register_flags() already picks the "
+                "right value, so a non-zero register rc means the runtime refuses "
+                "the range itself. Run without --src host to measure HBM->HBM."
+            )
+        return view, payload
+
+    def close(self) -> None:
+        """Unregister the host sources, never while a launch may still read them."""
+        if not self._host_regions:
+            return
+        torch.npu.synchronize()
+        lib = _acl_runtime()
+        for base, _size, _raw in self._host_regions:
+            rc = lib.aclrtHostUnregister(ctypes.c_void_p(base))
+            if rc:
+                print(f"warning: aclrtHostUnregister rc={rc} for 0x{base:x}", flush=True)
+        self._host_regions.clear()
 
     def run(self) -> None:
         torch.ops._C_ascend.scatter_copy_ub_bench(
@@ -455,16 +551,21 @@ def main(argv=None) -> int:
     print("-" * len(header))
     for label, case in points:
         bench = Bench(case)
-        if args.verify:
-            bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
-        us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
-        gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
-        print(
-            f"{label:>18} {case.rows:>7} {case.group_rows:>5} {case.bank:>4} "
-            f"{case.table_mode:>3} {case.cores:>5} {us_min:>9.1f} {gbps:>8.1f}"
-        )
-        if us_med != us_min:
-            print(f"{'':>18} median {us_med:.1f} us")
+        try:
+            if args.verify:
+                bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
+            us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
+            gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
+            print(
+                f"{label:>18} {case.rows:>7} {case.group_rows:>5} {case.bank:>4} "
+                f"{case.table_mode:>3} {case.cores:>5} {us_min:>9.1f} {gbps:>8.1f}"
+            )
+            if us_med != us_min:
+                print(f"{'':>18} median {us_med:.1f} us")
+        finally:
+            # Host sources stay registered (and the device may still be reading
+            # them) until every launch has retired.
+            bench.close()
     return 0
 
 

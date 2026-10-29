@@ -261,7 +261,13 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
   写侧允许任意正向步长，与生产里 miss pair 的合并写一致。随机行表下会退化成逐行 DMA，
   这正是我们想看到的「合并能不能用」的结论。
 - `--cores` 超过实际 AIV 数时会在 tiling 里被截断，标签仍显示请求值。
-- host 源依赖 `get_npu_view_from_cpu_tensor`（`aclrtHostGetDevicePointer` 的映射视图），
-  普通可分页 CPU 内存不受支持。
+- host 源依赖 `get_npu_view_from_cpu_tensor`（`aclrtHostGetDevicePointer` 的映射视图），普通可分页 CPU 内存不受支持。
+  **`torch.pin_memory()` 不够**：它只锁页，不会把这段内存发布给 device，所以该接口会返回 `None`
+  （报错 `the host buffer is not registered for device access`）。必须先
+  `aclrtHostRegisterV2(ptr, size, flags)` 注册，再取 device 地址；flags 在 **A5 上只能给
+  `ACL_HOST_REG_MAPPED`**（带 PINNED 会被拒，错误码 107000），A2/A3 是
+  `MAPPED|PINNED`。脚本现在按 `DeviceOperator.host_register_flags()` 自动选，并把 payload
+  对齐到 64KiB（同 `models/deepseek_v41/engram/npu.py` 的 `HostUvaBuffer`），跑完
+  `torch.npu.synchronize()` 后再 `aclrtHostUnregister`。
 - 计时为 host 侧 `torch.npu.Event` + N 次连续 launch，包含 launch 间隙；需要剔除
   调度开销时请配合 `msprof` 或 `torch_npu.profiler` 看单算子 task 时间。
