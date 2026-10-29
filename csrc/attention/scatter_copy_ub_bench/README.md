@@ -100,6 +100,48 @@ COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation # 2. 重编 vllm_
 （默认它是 1，会先把全量算子再编一次）。第 2 步只改了 `torch_binding.cpp` /
 新算子目录时是增量编译，通常一两分钟。
 
+### A5 上 `_C_ascend` 是空的：不是没编，是被 gate 掉了
+
+`vllm_ascend.utils.enable_custom_op()` 开头有一句提前返回：
+
+```python
+if envs.VLLM_BATCH_INVARIANT or not get_current_hardware_profile().supports(
+        HardwareCapability.RUNTIME_CUSTOM_OPS):
+    _CUSTOM_OP_ENABLED = False
+    return             # 从未 import vllm_ascend_C
+```
+
+而 `vllm_ascend/device/hardware_profile.py` 里 **A5（ascend950）的 capabilities 没有
+`RUNTIME_CUSTOM_OPS`**（代码注释写明「ASCEND950 上自定义算子编译/执行只部分可用，
+暂全部禁用」）。所以 950 机器上 `vllm_ascend_C` 根本没被加载，`torch.ops._C_ascend`
+是空命名空间——**这时重编多少次都没用**，报错文案里的「binding has not been rebuilt」
+是误导。
+
+`TORCH_LIBRARY(_C_ascend)` 的注册发生在 `.so` 的模块初始化里，所以只要 `import
+vllm_ascend.vllm_ascend_C` 就能拿到全部入口（`vllm_ascend/platform.py`、
+`models/minimax_m3/ops/msa_m3_npu.py` 都是这么直接 import 的）。压测脚本
+`benchmarks/kernel/scatter_copy_ub_bench.py` 已按这个逻辑处理：先走
+`enable_custom_op()`，拿不到 op 就自己 import 扩展，只有 import 之后仍然没有才判定
+是 `.so` 过期。
+
+手工确认当前机器是哪种情况：
+
+```bash
+python - <<'PY'
+import torch, torch_npu
+from vllm_ascend.device.hardware_profile import (
+    HardwareCapability, get_current_hardware_profile)
+from vllm_ascend.utils import enable_custom_op
+print("gate ok:", get_current_hardware_profile().supports(
+    HardwareCapability.RUNTIME_CUSTOM_OPS))
+print("enable_custom_op:", enable_custom_op())
+print("op present:", hasattr(torch.ops._C_ascend, "scatter_copy_ub_bench"))
+PY
+```
+
+`gate ok: False` 就是上面的原因；此时只要在脚本里手动 import 扩展即可，不要去改
+`hardware_profile.py`（那是运行时全局开关，会影响生产的自定义算子派发）。
+
 ### ascend950 / A5
 
 A5 没有 Vector 参与的纯拷贝用的是 `TQue<QuePosition::VECIN>` + 显式 fence，而不是

@@ -31,17 +31,24 @@ Examples:
     # DRAM (host pinned) -> HBM
     python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 --src host
 
-The operator must be built first, from the repository root::
+Two separate products must exist before the first run, from the repository
+root::
 
-    SOC_VERSION=ascend910b1 bash csrc/build_aclnn.sh
+    # 1. the aclnn kernel package (what the op actually executes)
+    SOC_VERSION=ascend950 bash csrc/build_aclnn.sh
+    # 2. the torch binding, i.e. torch.ops._C_ascend.scatter_copy_ub_bench
     COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation
 
-A subset build is enough while debugging::
+A subset kernel build is enough while debugging::
 
-    VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench bash csrc/build_aclnn.sh
+    VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
+        SOC_VERSION=ascend950 bash csrc/build_aclnn.sh
 
-The benchmark fails with a clear message when ``scatter_copy_ub_bench`` is not
-registered.
+On SoCs whose hardware profile does not declare ``RUNTIME_CUSTOM_OPS``
+(ascend950 / A5 today) ``vllm_ascend.utils.enable_custom_op()`` deliberately
+skips importing the extension, so ``torch.ops._C_ascend`` stays empty even
+after a correct build. This script imports the extension by hand in that case;
+a still-missing op then really does mean a stale ``vllm_ascend_C``.
 """
 
 from __future__ import annotations
@@ -59,6 +66,101 @@ torch_npu = None
 CKV_DIM = 512
 KPE_DIM = 64
 ROW_BYTES_PER_ELEM = CKV_DIM + KPE_DIM  # elements copied per token
+OP_NAME = "scatter_copy_ub_bench"
+REBUILD_BINDING = (
+    "  rebuild the torch binding (the kernel package alone does not register it):\n"
+    "    rm -f vllm_ascend/vllm_ascend_C*.so\n"
+    "    COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation"
+)
+
+
+def _op_registered() -> bool:
+    return hasattr(torch.ops._C_ascend, OP_NAME)
+
+
+def _custom_op_gate() -> str | None:
+    """Why ``enable_custom_op()`` refuses to load the extension, if it does.
+
+    ``vllm_ascend.utils.enable_custom_op()`` returns early -- without importing
+    ``vllm_ascend_C`` -- whenever ``VLLM_BATCH_INVARIANT`` is set or the current
+    hardware profile does not declare ``RUNTIME_CUSTOM_OPS`` (ascend950 / A5
+    today, where the production custom ops are only partially usable). In that
+    case no rebuild can make ``torch.ops._C_ascend.<op>`` appear: the module is
+    simply never imported. A standalone microbenchmark only needs the torch
+    library entry points, so it imports the extension itself; this helper only
+    explains why the normal path was skipped.
+    """
+    try:
+        import vllm.envs as envs
+        from vllm_ascend.device.hardware_profile import (
+            HardwareCapability,
+            get_current_hardware_profile,
+        )
+    except Exception:  # optional diagnostics only
+        return None
+    if envs.VLLM_BATCH_INVARIANT:
+        return "VLLM_BATCH_INVARIANT is set, so enable_custom_op() skips vllm_ascend_C"
+    if get_current_hardware_profile().supports(HardwareCapability.RUNTIME_CUSTOM_OPS):
+        return None
+    return (
+        "this SoC's hardware profile does not declare RUNTIME_CUSTOM_OPS "
+        "(ascend950/A5), so enable_custom_op() skips vllm_ascend_C"
+    )
+
+
+def _import_extension() -> None:
+    """Import ``vllm_ascend_C`` directly, bypassing the enable_custom_op() gate.
+
+    Importing the module is what runs its ``TORCH_LIBRARY`` registrations, so
+    this makes every ``torch.ops._C_ascend.*`` entry point available. The same
+    manual import is used by ``vllm_ascend/platform.py`` and
+    ``vllm_ascend/models/minimax_m3/ops/msa_m3_npu.py``.
+    """
+    import importlib.util
+
+    from vllm_ascend import utils as ascend_utils
+
+    # enable_custom_op() normally publishes the op package path before the
+    # import; it may have bailed out earlier, so do it here as well.
+    try:
+        ascend_utils.bootstrap_custom_op_env(include_vendor_lib=True)
+    except Exception:  # noqa: BLE001 - env plumbing must not mask the import
+        pass
+
+    if importlib.util.find_spec("vllm_ascend.vllm_ascend_C") is None:
+        raise SystemExit(
+            "vllm_ascend.vllm_ascend_C is not built, so the torch binding cannot "
+            "be registered at all.\n" + REBUILD_BINDING
+        )
+    try:
+        import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+    except ImportError as exc:
+        raise SystemExit(
+            f"vllm_ascend.vllm_ascend_C exists but cannot be imported: {exc}\n"
+            "  its shared-library dependencies do not resolve; check "
+            "ASCEND_HOME_PATH and LD_LIBRARY_PATH, then\n" + REBUILD_BINDING
+        ) from exc
+
+
+def _warn_if_kernel_package_missing() -> None:
+    """The binding is only half of it: the aclnn kernel must be loadable too."""
+    import os
+
+    import vllm_ascend
+
+    vendor = os.path.join(
+        os.path.dirname(os.path.abspath(vllm_ascend.__file__)),
+        "_cann_ops_custom",
+        "vendors",
+        "custom_transformer",
+    )
+    if not os.path.isdir(vendor):
+        print(
+            f"warning: kernel package missing at {vendor}; the op will fail at "
+            "launch time.\n"
+            "  build it first: SOC_VERSION=<soc> bash csrc/build_aclnn.sh",
+            file=sys.stderr,
+        )
 
 
 def _load_runtime():
@@ -68,17 +170,22 @@ def _load_runtime():
     torch_npu = _torch_npu
     from vllm_ascend.utils import enable_custom_op
 
+    gate = _custom_op_gate()
     enable_custom_op()
-    if not hasattr(torch.ops._C_ascend, "scatter_copy_ub_bench"):
+    loaded_manually = False
+    if not _op_registered():
+        _import_extension()
+        loaded_manually = True
+    if not _op_registered():
         raise SystemExit(
-            "_C_ascend.scatter_copy_ub_bench is not registered: the torch "
-            "binding has not been rebuilt.\n"
-            "  1) build the op package (VLLM_ASCEND_CUSTOM_OPS limits it to "
-            "this op):\n"
-            "     SOC_VERSION=ascend910b1 bash csrc/build_aclnn.sh\n"
-            "  2) rebuild the extension:\n"
-            "     COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation"
+            f"_C_ascend.{OP_NAME} is missing even after importing "
+            "vllm_ascend_C: the built extension is older than the binding.\n"
+            + REBUILD_BINDING
         )
+    if loaded_manually:
+        reason = f" ({gate})" if gate else ""
+        print(f"note: imported vllm_ascend_C directly{reason}.", file=sys.stderr)
+    _warn_if_kernel_package_missing()
 
 
 @dataclass
