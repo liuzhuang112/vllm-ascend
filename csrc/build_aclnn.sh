@@ -85,6 +85,63 @@ log_selected_ops() {
     done
 }
 
+# opbuild only writes ${ASCEND_AUTOGEN_PATH}/{aclnn,inner,exc}/aic-<soc>-ops-info.ini
+# for the op defs it is handed, and a def only carries the SoCs listed in its
+# AICore().AddConfig() calls. A subset build made only of 910B defs therefore
+# produces no `inner/aic-ascend950-ops-info.ini`, and the packaging step that
+# expects that file fails long after the real cause. Detect it up front.
+ops_capable_of_inner_ini() {
+    local soc=$1
+    local op_name op_dir
+    for op_name in "${CUSTOM_OPS_ARRAY[@]}"; do
+        op_dir=$(resolve_op_dir "${op_name}")
+        [[ -n "${op_dir}" && -f "${op_dir}/op_host/CMakeLists.txt" ]] || continue
+        if grep -qsE "ACLNNTYPE[[:space:]]+aclnn_inner" "${op_dir}/op_host/CMakeLists.txt" &&
+            grep -qsF "AddConfig(\"${soc}\"" "${op_dir}/op_host/"*def*.cpp 2>/dev/null; then
+            echo "${op_name}"
+        fi
+    done
+}
+
+check_subset_can_emit_inner_ini() {
+    local soc=$1
+    local producers first_candidate
+
+    producers=$(ops_capable_of_inner_ini "${soc}")
+    if [[ -n "${producers}" ]]; then
+        log "inner ops-info for ${soc}: produced by [$(echo "${producers}" | paste -sd' ' -)]"
+        return 0
+    fi
+    if [[ "${VLLM_ASCEND_ALLOW_MISSING_OPS_INFO:-0}" == "1" ]]; then
+        log "WARNING: no ${soc}-capable aclnn_inner op selected; continuing anyway"
+        return 0
+    fi
+
+    log "ERROR: the selected subset cannot generate inner/aic-${soc}-ops-info.ini"
+    log "  opbuild creates that file only from op defs that are BOTH"
+    log "    ACLNNTYPE aclnn_inner (in op_host/CMakeLists.txt) AND"
+    log "    AICore().AddConfig(\"${soc}\") (in op_host/*_def.cpp)."
+    log "  Without it the later packaging step fails on the missing file."
+    first_candidate=$(
+        find "${ROOT_DIR}/csrc" -maxdepth 4 -path '*/op_host/CMakeLists.txt' -print 2>/dev/null |
+            while read -r op_host_cmake; do
+                op_dir=$(dirname "${op_host_cmake}")
+                if grep -qsE "ACLNNTYPE[[:space:]]+aclnn_inner" "${op_host_cmake}" &&
+                    grep -qsF "AddConfig(\"${soc}\"" "${op_dir}/"*def*.cpp 2>/dev/null; then
+                    basename "$(dirname "${op_dir}")"
+                fi
+            done | sort -u | head -n 1
+    )
+    if [[ -n "${first_candidate}" ]]; then
+        log "  fix: add ${first_candidate} to the subset, e.g."
+        log "    VLLM_ASCEND_CUSTOM_OPS='${first_candidate};${CUSTOM_OPS_ARRAY[0]}' \\"
+        log "        bash csrc/build_aclnn.sh \"\$PWD\" ${soc}"
+    fi
+    log "  or drop VLLM_ASCEND_CUSTOM_OPS and build the full ${soc} list."
+    log "  bypass: VLLM_ASCEND_ALLOW_MISSING_OPS_INFO=1"
+    return 1
+}
+
 log "start: ROOT_DIR=${ROOT_DIR:-<unset>} SOC_VERSION=${SOC_VERSION:-<unset>} cwd=$(pwd)"
 log "env: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-<unset>}"
 
@@ -260,6 +317,11 @@ if [[ -n "${VLLM_ASCEND_CUSTOM_OPS:-}" ]]; then
     IFS=';,' read -ra CUSTOM_OPS_ARRAY <<< "${VLLM_ASCEND_CUSTOM_OPS}"
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     log "VLLM_ASCEND_CUSTOM_OPS override -> ${CUSTOM_OPS}"
+    # A subset that carries no SoC-matching aclnn_inner def would silently drop
+    # the inner ops-info ini and break packaging much later; fail fast instead.
+    if ! check_subset_can_emit_inner_ini "${SOC_ARG}"; then
+        exit 1
+    fi
 fi
 
 log_selected_ops
