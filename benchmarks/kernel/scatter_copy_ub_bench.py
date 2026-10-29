@@ -37,12 +37,18 @@ root::
     # 1. the aclnn kernel package (what the op actually executes)
     SOC_VERSION=ascend950 bash csrc/build_aclnn.sh
     # 2. the torch binding, i.e. torch.ops._C_ascend.scatter_copy_ub_bench
-    COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation
+    SOC_VERSION=ascend950 pip install -e . --no-build-isolation
 
-A subset kernel build is enough while debugging::
+Both can be produced in one go; ``VLLM_ASCEND_CUSTOM_OPS`` keeps the kernel step
+cheap::
 
-    VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
-        SOC_VERSION=ascend950 bash csrc/build_aclnn.sh
+    SOC_VERSION=ascend950 VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
+        pip install -e . --no-build-isolation
+
+Do NOT pass ``COMPILE_CUSTOM_KERNELS=0`` here: setup.py:422 empties
+``ext_modules`` for it, so pip then compiles neither the kernel package nor
+``vllm_ascend_C`` -- it is the "install the python part only" switch, not a
+"skip the kernels" one.
 
 On SoCs whose hardware profile does not declare ``RUNTIME_CUSTOM_OPS``
 (ascend950 / A5 today) ``vllm_ascend.utils.enable_custom_op()`` deliberately
@@ -68,9 +74,13 @@ KPE_DIM = 64
 ROW_BYTES_PER_ELEM = CKV_DIM + KPE_DIM  # elements copied per token
 OP_NAME = "scatter_copy_ub_bench"
 REBUILD_BINDING = (
-    "  rebuild the torch binding (the kernel package alone does not register it):\n"
-    "    rm -f vllm_ascend/vllm_ascend_C*.so\n"
-    "    COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation"
+    "  build the torch binding; the kernel package alone does not register it:\n"
+    "    SOC_VERSION=<soc> VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \\\n"
+    "        pip install -e . --no-build-isolation\n"
+    "  (COMPILE_CUSTOM_KERNELS=0 would build nothing: setup.py empties "
+    "ext_modules for it.)\n"
+    "  If vllm_ascend_C*.so already exists, it is stale -- remove it first:\n"
+    "    find . -name 'vllm_ascend_C*.so' -delete"
 )
 
 

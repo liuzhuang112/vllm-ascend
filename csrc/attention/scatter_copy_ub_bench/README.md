@@ -92,13 +92,28 @@ VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench bash csrc/build_aclnn.sh
 所以流程是：
 
 ```bash
-SOC_VERSION=ascend910b1 bash csrc/build_aclnn.sh              # 1. 算子包
-COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation # 2. 重编 vllm_ascend_C
+SOC_VERSION=ascend910b1 bash csrc/build_aclnn.sh               # 1. 算子包
+SOC_VERSION=ascend910b1 pip install -e . --no-build-isolation  # 2. 编 vllm_ascend_C
 ```
 
-`COMPILE_CUSTOM_KERNELS=0` 是为了让第 2 步只编 C++ 扩展、不再重跑一遍算子包
-（默认它是 1，会先把全量算子再编一次）。第 2 步只改了 `torch_binding.cpp` /
-新算子目录时是增量编译，通常一两分钟。
+第 2 步默认 `COMPILE_CUSTOM_KERNELS=1`，`cmake_build_ext.run()` 会**先再跑一遍
+`build_aclnn.sh`**（全量，慢），然后 cmake 编扩展。想只编这一个算子就加
+`VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench`，两步合一：
+
+```bash
+SOC_VERSION=ascend950 VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
+    pip install -e . --no-build-isolation
+```
+
+> **不要**用 `COMPILE_CUSTOM_KERNELS=0` 来“只编扩展”。`setup.py:422` 在它为 0 时把
+> `ext_modules` 设成空列表，`build_extensions()` 直接 `return`——算子包和
+> `vllm_ascend_C.so` **都不会生成**，`import vllm_ascend.vllm_ascend_C` 报
+> `ModuleNotFoundError`。它只是“只装 Python 部分”的开关（官方 installation.md 里也是
+> 这个语义：*skips building the native extensions and custom operators*）。
+>
+> 只改了 `torch_binding.cpp` / 新算子目录时，cmake 是增量编译，通常一两分钟；但若
+> `vllm_ascend_C*.so` 已存在且时间戳比源文件新，会跳过重链，此时先
+> `find . -name 'vllm_ascend_C*.so' -delete` 再装。
 
 ### A5 上 `_C_ascend` 是空的：不是没编，是被 gate 掉了
 
