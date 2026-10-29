@@ -270,18 +270,67 @@ class Bench:
             self.case.cores,
         )
 
-    def verify(self, sample: int = 64) -> None:
-        """Compare the first `sample` destination rows against the source."""
-        self.run()
-        torch.npu.synchronize()
+    def verify(self, sample: int = 64, repeats: int = 1) -> None:
+        """Compare the copied rows against the source, and report *how* they differ.
+
+        ``repeats > 1`` re-runs the op and re-checks every time, which is the
+        only way to catch a non-deterministic kernel: a launch that passes once
+        and fails later points at uninitialised state or a missing fence, not at
+        an addressing bug (that one fails every time, on the same rows).
+        """
         sample = min(sample, self.case.rows)
         idx = torch.arange(sample, dtype=torch.int64)
-        want_kv = self._source_cpu(self.src_kv_cpu, self.src_kv_dev)[self.src_rows[idx].to(torch.int64)]
-        want_rope = self._source_cpu(self.src_rope_cpu, self.src_rope_dev)[self.src_rows[idx].to(torch.int64)]
-        got_kv = self.dst_kv[self.dst_rows[idx].to(torch.int64)].cpu()
-        got_rope = self.dst_rope[self.dst_rows[idx].to(torch.int64)].cpu()
-        torch.testing.assert_close(got_kv, want_kv, rtol=0, atol=0)
-        torch.testing.assert_close(got_rope, want_rope, rtol=0, atol=0)
+        src_flat = self._source_cpu(self.src_kv_cpu, self.src_kv_dev)
+        rope_flat = self._source_cpu(self.src_rope_cpu, self.src_rope_dev)
+        want_kv = src_flat[self.src_rows[idx].to(torch.int64)]
+        want_rope = rope_flat[self.src_rows[idx].to(torch.int64)]
+        dst_idx = self.dst_rows[idx].to(torch.int64)
+
+        for attempt in range(repeats):
+            self.run()
+            torch.npu.synchronize()
+            got_kv = self.dst_kv[dst_idx].cpu()
+            got_rope = self.dst_rope[dst_idx].cpu()
+            bad_kv = (got_kv != want_kv).any(dim=1)
+            bad_rope = (got_rope != want_rope).any(dim=1)
+            if bool(bad_kv.any()) or bool(bad_rope.any()):
+                self._report_mismatch(attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
+                                      src_flat, rope_flat)
+                raise AssertionError(
+                    f"scatter_copy_ub_bench verify failed on attempt {attempt + 1}/{repeats} "
+                    f"(see the report above)"
+                )
+
+    def _report_mismatch(self, attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
+                         src_flat, rope_flat) -> None:
+        rows = torch.nonzero(bad_kv | bad_rope).flatten().tolist()
+        total_kv = int((got_kv != want_kv).sum())
+        total_rope = int((got_rope != want_rope).sum())
+        print(
+            f"\nverify: attempt {attempt + 1}/{repeats} mismatched {len(rows)}/{got_kv.shape[0]} sampled rows "
+            f"(kv {total_kv} elems, rope {total_rope} elems; rows {rows[:8]})",
+            file=sys.stderr,
+        )
+        for r in rows[:4]:
+            dst_tok = int(self.dst_rows[r])
+            src_tok = int(self.src_rows[r])
+            got, want = got_kv[r], want_kv[r]
+            cols = torch.nonzero(got != want).flatten()
+            # Which source row (if any) did the destination actually receive?
+            # A hit means broken address generation; a miss plus all-zero means
+            # the row was never written; a miss plus non-zero means a torn DMA.
+            hits = torch.nonzero((src_flat == got).all(dim=1)).flatten()
+            hint = "no other source row matches -> torn or stale DMA"
+            if hits.numel():
+                hint = f"payload equals source row(s) {hits[:4].tolist()} (expected {src_tok})"
+            elif bool((got == 0).all()):
+                hint = "all zeros -> row never written"
+            print(
+                f"  sample row {r}: dst_tok={dst_tok} src_tok={src_tok}, "
+                f"kv bad {cols.numel()}/{want.numel()} cols [{int(cols[0])}..{int(cols[-1])}], "
+                f"rope {'bad' if bool((got_rope[r] != want_rope[r]).any()) else 'ok'} | {hint}",
+                file=sys.stderr,
+            )
 
     def _source_cpu(self, host, view):
         return host if host is not None else view.cpu()
@@ -324,6 +373,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--verify", action="store_true", help="check copied rows before timing")
+    parser.add_argument(
+        "--repeat-verify",
+        type=int,
+        default=1,
+        help="with --verify, re-run and re-check N times (N>1 exposes flaky kernels)",
+    )
     parser.add_argument(
         "--sweep",
         choices=("none", "group-rows", "bank", "table-mode", "cores", "src"),
@@ -373,7 +428,7 @@ def main(argv=None) -> int:
     for label, case in points:
         bench = Bench(case)
         if args.verify:
-            bench.verify()
+            bench.verify(repeats=max(1, args.repeat_verify))
         us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
         gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
         print(

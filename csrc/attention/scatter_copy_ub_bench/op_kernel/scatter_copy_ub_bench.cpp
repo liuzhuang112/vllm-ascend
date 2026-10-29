@@ -162,7 +162,15 @@ private:
         // The queue type depends on the class template parameter BANK_COUNT, so
         // the member template has to be disambiguated with `template`.
         LocalTensor<T> local = copyQueue_.template AllocTensor<T>();
-        DataCopyPadExtParams<T> padParams;  // no padding, same default as production
+        // Always spell out every field: DataCopyPadExtParams is a plain struct,
+        // so a bare `DataCopyPadExtParams<T> padParams;` leaves isPad and the
+        // padding counts as UB stack garbage. A garbage isPad=true turns the
+        // transfer into padded mode with random left/right padding, which
+        // corrupts part of the row and differs from launch to launch -- exactly
+        // the "passes once, fails the next run" symptom. Every other kernel in
+        // this repo initialises it explicitly for the same reason.
+        DataCopyPadExtParams<T> padParams{false, static_cast<uint8_t>(0), static_cast<uint8_t>(0),
+                                          static_cast<T>(0)};
         DataCopyExtParams params;
         params.blockCount = 1;
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
