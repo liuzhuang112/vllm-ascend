@@ -159,7 +159,9 @@ private:
         coalescedIn_[slot] = srcContiguous;
         coalescedOut_[slot] = dstStrided;
 
-        LocalTensor<T> local = copyQueue_.AllocTensor<T>();
+        // The queue type depends on the class template parameter BANK_COUNT, so
+        // the member template has to be disambiguated with `template`.
+        LocalTensor<T> local = copyQueue_.template AllocTensor<T>();
         DataCopyPadExtParams<T> padParams;  // no padding, same default as production
         DataCopyExtParams params;
         params.blockCount = 1;
@@ -192,7 +194,7 @@ private:
 
     __aicore__ inline void CopyOut(uint32_t slot)
     {
-        LocalTensor<T> local = copyQueue_.DeQue<T>();
+        LocalTensor<T> local = copyQueue_.template DeQue<T>();
         DataCopyExtParams params;
         params.blockCount = 1;
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
