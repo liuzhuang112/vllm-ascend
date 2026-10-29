@@ -26,6 +26,8 @@
  */
 
 #include "kernel_operator.h"
+#include "kernel_tiling/kernel_tiling.h"
+#include "scatter_copy_ub_bench_tiling_data.h"
 
 using namespace AscendC;
 
@@ -151,7 +153,7 @@ private:
         coalescedOut_[slot] = dstStrided;
 
         LocalTensor<T> local = copyQueue_.AllocTensor<T>();
-        DataCopyPadExtParams<T> padParams{false, 0, 0, 0};
+        DataCopyPadExtParams<T> padParams;  // no padding, same default as production
         DataCopyExtParams params;
         params.blockCount = 1;
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
@@ -251,16 +253,18 @@ extern "C" __global__ __aicore__ void scatter_copy_ub_bench(GM_ADDR srcKv, GM_AD
                                                             GM_ADDR workspace, GM_ADDR tiling)
 {
     (void)workspace;
-    GET_TILING_DATA(tilingData, tiling);
+    REGISTER_TILING_DEFAULT(ScatterCopyUbBenchTilingData);
+    GET_TILING_DATA_WITH_STRUCT(ScatterCopyUbBenchTilingData, tilingData, tiling);
+
     TPipe pipe;
-    if (TILING_KEY_IS(1)) {
-        KERNEL_TASK_TYPE(1, KERNEL_TYPE_AIV_ONLY);
-        ScatterCopyUbBenchKernel<bfloat16_t, SCB_MAX_BANKS> op;
+    // Both instantiations are compiled here on purpose: the element type is a
+    // runtime field, so the op needs no tiling-key registration.
+    if (tilingData.dataType == 2) {
+        ScatterCopyUbBenchKernel<half, SCB_MAX_BANKS> op;
         op.Init(srcKv, srcRope, srcRows, dstRows, dstKv, dstRope, tilingData, &pipe);
         op.Process();
-    } else if (TILING_KEY_IS(2)) {
-        KERNEL_TASK_TYPE(2, KERNEL_TYPE_AIV_ONLY);
-        ScatterCopyUbBenchKernel<half, SCB_MAX_BANKS> op;
+    } else {
+        ScatterCopyUbBenchKernel<bfloat16_t, SCB_MAX_BANKS> op;
         op.Init(srcKv, srcRope, srcRows, dstRows, dstKv, dstRope, tilingData, &pipe);
         op.Process();
     }

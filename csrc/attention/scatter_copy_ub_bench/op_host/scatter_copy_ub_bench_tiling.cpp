@@ -102,25 +102,35 @@ ge::graphStatus Tiling4ScatterCopyUbBench(gert::TilingContext *context)
     }
     workspace[0] = ascendcPlatform.GetLibApiWorkSpaceSize();
 
-    tiling.set_numTokens(numTokens);
-    tiling.set_ckvDim(ckvDim);
-    tiling.set_kpeDim(kpeDim);
-    tiling.set_groupRows(groupRows);
-    tiling.set_bankNum(bankNum);
-    tiling.set_usedCoreNum(blockDim);
-    tiling.set_tableMode(tableMode);
-
-    // Tiling key selects the element type in the kernel: 1 = bf16, 2 = fp16.
+    // The element type is a plain field instead of a tiling key: the kernel
+    // then instantiates both branches unconditionally, which keeps the op free
+    // of any tiling-key registration in the build.
+    int64_t dataType = 0;
     if (srcKvDesc->GetDataType() == ge::DT_BF16) {
-        context->SetTilingKey(1);
+        dataType = 1;
     } else if (srcKvDesc->GetDataType() == ge::DT_FLOAT16) {
-        context->SetTilingKey(2);
+        dataType = 2;
     } else {
         return ge::GRAPH_FAILED;
     }
 
-    tiling.SaveToBuffer(context->GetRawTilingData()->GetData(), context->GetRawTilingData()->GetCapacity());
-    context->GetRawTilingData()->SetDataSize(tiling.GetDataSize());
+    auto rawTiling = context->GetRawTilingData();
+    if (rawTiling == nullptr || rawTiling->GetCapacity() < sizeof(ScatterCopyUbBenchTilingData)) {
+        return ge::GRAPH_FAILED;
+    }
+    auto *tiling = context->GetTilingData<ScatterCopyUbBenchTilingData>();
+    if (tiling == nullptr) {
+        return ge::GRAPH_FAILED;
+    }
+    tiling->numTokens = numTokens;
+    tiling->ckvDim = ckvDim;
+    tiling->kpeDim = kpeDim;
+    tiling->groupRows = groupRows;
+    tiling->bankNum = bankNum;
+    tiling->usedCoreNum = blockDim;
+    tiling->tableMode = tableMode;
+    tiling->dataType = dataType;
+    rawTiling->SetDataSize(sizeof(ScatterCopyUbBenchTilingData));
     return ge::GRAPH_SUCCESS;
 }
 
