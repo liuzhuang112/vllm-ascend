@@ -142,6 +142,57 @@ check_subset_can_emit_inner_ini() {
     return 1
 }
 
+# gen_opbuild_target() declares only the generated aclnn headers/sources as
+# OUTPUT of its custom command; the per-SoC autogen/<group>/aic-<soc>-ops-info.ini
+# it writes along the way is not an output, and the command lists no DEPENDS on
+# the *_def.cpp files. Once those aclnn*.{h,cpp} exist from an earlier build the
+# command counts as up to date, opbuild never runs again, and the ini of the new
+# SoC is never written. The failure then surfaces much later, in
+# add_ops_info_target(), as a missing inner/aic-<soc>-ops-info.ini while the
+# directory still holds the ini of whichever SoC built it first.
+prepare_build_tree() {
+    local soc=$1
+    local build_dir="${ROOT_DIR}/csrc/build"
+    local autogen_dir="${build_dir}/autogen"
+
+    if [[ "${VLLM_ASCEND_CLEAN_BUILD:-0}" == "1" ]]; then
+        log "VLLM_ASCEND_CLEAN_BUILD=1 -> removing ${build_dir}"
+        rm -rf -- "${build_dir}"
+        return 0
+    fi
+    [[ -d "${build_dir}" ]] || return 0
+
+    local cached_soc=""
+    if [[ -f "${build_dir}/CMakeCache.txt" ]]; then
+        cached_soc=$(sed -n 's/^ASCEND_COMPUTE_UNIT:[A-Za-z_]*=//p' "${build_dir}/CMakeCache.txt" | head -n 1)
+    fi
+    if [[ -n "${cached_soc}" && "${cached_soc}" != "${soc}" ]]; then
+        log "WARNING: csrc/build was configured for '${cached_soc}', now building '${soc}'"
+        log "  opbuild will not regenerate the per-SoC ops-info ini in a reused"
+        log "  build dir, so the tree is wiped (this run is a full rebuild)."
+        rm -rf -- "${build_dir}"
+        return 0
+    fi
+    if [[ -d "${autogen_dir}" && ! -f "${autogen_dir}/inner/aic-${soc}-ops-info.ini" ]]; then
+        log "WARNING: ${autogen_dir}/inner/aic-${soc}-ops-info.ini is missing"
+        log "  removing autogen/ and tbe/ so opbuild re-runs and rewrites it"
+        rm -rf -- "${autogen_dir}" "${build_dir}/tbe"
+        return 0
+    fi
+    # Same reason, other direction: editing an op def must also force opbuild to
+    # re-run, otherwise the ini keeps describing the previous attributes/SoC.
+    local ini="${autogen_dir}/inner/aic-${soc}-ops-info.ini"
+    local newer_def=""
+    if [[ -f "${ini}" ]]; then
+        newer_def=$(find "${ROOT_DIR}/csrc" -name '*_def.cpp' -newer "${ini}" -print -quit 2>/dev/null)
+    fi
+    if [[ -n "${newer_def}" ]]; then
+        log "WARNING: ${newer_def#"${ROOT_DIR}/csrc/"} is newer than ${ini#"${ROOT_DIR}/csrc/build/"}"
+        log "  removing autogen/ and tbe/ so opbuild picks the new op def up"
+        rm -rf -- "${autogen_dir}" "${build_dir}/tbe"
+    fi
+}
+
 log "start: ROOT_DIR=${ROOT_DIR:-<unset>} SOC_VERSION=${SOC_VERSION:-<unset>} cwd=$(pwd)"
 log "env: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} ASCEND_TOOLKIT_HOME=${ASCEND_TOOLKIT_HOME:-<unset>}"
 
@@ -347,7 +398,8 @@ log_selected_ops
   log "subshell cwd before cd=$(pwd)"
   cd "${ROOT_DIR}/csrc"
   log "subshell cwd after cd=$(pwd)"
-  log "preserving csrc/build and cleaning output dirs"
+  prepare_build_tree "${SOC_ARG}"
+  log "cleaning output dirs"
   rm -rf -- output build_out
 
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"

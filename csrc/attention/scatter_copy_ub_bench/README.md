@@ -61,6 +61,27 @@ VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench bash csrc/build_aclnn.sh
 编译完成后 `torch.ops._C_ascend.scatter_copy_ub_bench` 即可用（需要
 `vllm_ascend.utils.enable_custom_op()`）。
 
+### 换 SoC 前必须先清 `csrc/build`（脚本已自动处理）
+
+`csrc/cmake/opbuild.cmake` 里生成算子信息的自定义命令只把
+`autogen/<组>/aclnn*.{h,cpp}` 声明为 `OUTPUT`，**没有**把同样由它写出的
+`autogen/inner/aic-<soc>-ops-info.ini` 列为输出，也没有 `DEPENDS` 任何
+`*_def.cpp`。于是只要那些 aclnn 源文件还在，opbuild 就被判定为最新、不再执行，
+而下游 `add_ops_info_target()` 仍然要读 `inner/aic-<soc>-ops-info.ini` —— 这正是
+「先编过 910B，再编 950 时报缺 `aic-ascend950-ops-info.ini`，且 `inner/` 里只有
+910b/910_93」的成因，`/Users/zhuang/Desktop/vllm-ascend` 那份之所以正常，只是因为
+它的 `build/` 是全新的。
+
+`build_aclnn.sh` 现在会在编译前检查三种情况并自动清理（都会打 `WARNING` 日志）：
+
+| 情况 | 处理 |
+|:---|:---|
+| `CMakeCache.txt` 里的 `ASCEND_COMPUTE_UNIT` 与本次 SoC 不一致 | `rm -rf csrc/build`（完整重编） |
+| 目标 SoC 的 `autogen/inner/aic-<soc>-ops-info.ini` 缺失 | `rm -rf csrc/build/autogen csrc/build/tbe`（强制 opbuild 重跑） |
+| 某个 `*_def.cpp` 比该 ini 更新（改过算子定义） | 同上 |
+
+想无条件全量重编：`VLLM_ASCEND_CLEAN_BUILD=1 bash csrc/build_aclnn.sh`。
+
 注意这里有**两个独立的产物**，缺一个都跑不起来：
 
 | 产物 | 由谁编译 | 不编会怎样 |
