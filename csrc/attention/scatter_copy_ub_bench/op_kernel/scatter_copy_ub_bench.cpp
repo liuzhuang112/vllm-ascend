@@ -9,9 +9,15 @@
  *     DRAM src  --MTE2 DataCopyPad-->  UB bank  --MTE3 DataCopyPad-->  HBM dst
  *
  * Only the copy is kept. There is no vector compute, so the two transfers are
- * the whole pipeline: a TQueBind<VECIN, VECOUT> queue of `bank_num` slots keeps
+ * the whole pipeline: a TQue<VECIN> queue of `bank_num` slots keeps
  * `bank_num - 1` reads in flight while the oldest bank drains to HBM, which is
- * exactly the 2-slot software pipeline used by FirstFillScatterCopyKernel.
+ * exactly the software pipeline used by FirstFillScatterCopyKernel.
+ *
+ * The queue is a plain VECIN queue rather than a TQueBind: the A5 (arch35)
+ * kernels never use TQueBind, they allocate a VECIN buffer, fill it with MTE2,
+ * write it out with MTE3 and then fence MTE3_MTE2 before releasing it. Both the
+ * standalone UnionCopy() scatter of the A5 fused op and its per-token
+ * source-gather path do exactly that, so this file follows them.
  *
  * Differences from the production kernel (all of them are knobs here):
  *   - bank_num / group_rows / core_num are runtime parameters instead of
@@ -67,7 +73,8 @@ public:
         // starts 32B aligned so both planes stay DMA friendly.
         kpeOffsetElems_ = AlignBytesToElems(groupRows_ * ckvDim_ * static_cast<int64_t>(sizeof(T)));
         const int64_t slotElems = kpeOffsetElems_ + groupRows_ * kpeDim_;
-        pipe_->InitBuffer(copyQueue_, bankNum_, static_cast<uint32_t>(slotElems * sizeof(T)));
+        pipe_->InitBuffer(copyQueue_, static_cast<uint8_t>(bankNum_),
+                          static_cast<uint32_t>(slotElems * sizeof(T)));
     }
 
     __aicore__ inline void Process()
@@ -213,6 +220,12 @@ private:
                             local[kpeOffsetElems_ + r * kpeDim_], params);
             }
         }
+        // MTE3 drains the bank asynchronously, so the queue must not hand the
+        // buffer back to MTE2 before the store retires. This is the fence the
+        // production A5 copy paths use before they release a VECIN buffer.
+        const auto writeDone = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+        SetFlag<HardEvent::MTE3_MTE2>(writeDone);
+        WaitFlag<HardEvent::MTE3_MTE2>(writeDone);
         copyQueue_.FreeTensor(local);
     }
 
@@ -224,7 +237,9 @@ private:
     GlobalTensor<T> dstRopeGm_;
     GlobalTensor<int32_t> srcRowsGm_;
     GlobalTensor<int32_t> dstRowsGm_;
-    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, BANK_COUNT> copyQueue_;
+    // VECIN rather than TQueBind: see the file header. The element type is a
+    // tiling field, so both instantiations below exist in one binary.
+    TQue<QuePosition::VECIN, BANK_COUNT> copyQueue_;
 
     int64_t coreIdx_ = 0;
     int64_t numTokens_ = 0;
@@ -253,6 +268,9 @@ extern "C" __global__ __aicore__ void scatter_copy_ub_bench(GM_ADDR srcKv, GM_AD
                                                             GM_ADDR workspace, GM_ADDR tiling)
 {
     (void)workspace;
+    // Pure MTE2/MTE3 work: ask for AIV-only so the A5 scheduler does not pair
+    // the block with an idle AIC. Same macro the dual-arch AIV ops use.
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(ScatterCopyUbBenchTilingData);
     GET_TILING_DATA_WITH_STRUCT(ScatterCopyUbBenchTilingData, tilingData, tiling);
 

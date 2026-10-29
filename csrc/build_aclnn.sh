@@ -295,6 +295,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "kda_layout_swap12"
         "k2q_csr"
         "sparse_attention_score"
+        # DRAM -> HBM copy microbenchmark (A5 entry is the same kernel source).
+        "scatter_copy_ub_bench"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")

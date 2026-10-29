@@ -53,6 +53,20 @@ public:
             .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
         this->AICore().AddConfig("ascend910b", config);
         this->AICore().AddConfig("ascend910_93", config);
+
+        // A5. The kernel body only uses MTE2/MTE3 + TQue, so the same source
+        // entry serves arch22 and arch35; no _apt.cpp / opFile override needed
+        // (the 950-only fused scatter-copy op is a single .cpp as well).
+        OpAICoreConfig a5Config;
+        a5Config.DynamicCompileStaticFlag(true)
+            .DynamicFormatFlag(true)
+            .DynamicRankSupportFlag(true)
+            .DynamicShapeSupportFlag(true)
+            .NeedCheckSupportFlag(false)
+            .PrecisionReduceFlag(true)
+            .ExtendCfgInfo("aclnnSupport.value", "support_aclnn")
+            .ExtendCfgInfo("jitCompile.flag", "static_false,dynamic_false");
+        this->AICore().AddConfig("ascend950", a5Config);
     }
 };
 

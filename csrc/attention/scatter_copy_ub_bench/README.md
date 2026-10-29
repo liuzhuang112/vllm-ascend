@@ -9,7 +9,7 @@
 | 生产代码 | 本 demo |
 |:---|:---|
 | `op_kernel/first_fill_scatter_copy_kernel.h` 的 `CopyIn` / `CopyOut` | `op_kernel/scatter_copy_ub_bench.cpp` 的同名函数 |
-| `TQueBind<VECIN, VECOUT, 2>` + `CopyIn(next) / CopyOut(cur)` 两槽软件流水 | `TQueBind` 深度由 `bank_num` 指定，`bank_num - 1` 级预取 |
+| `TQueBind<VECIN, VECOUT, 2>` + `CopyIn(next) / CopyOut(cur)` 两槽软件流水 | `TQue<VECIN>` 深度由 `bank_num` 指定，`bank_num - 1` 级预取；A5 无 `TQueBind`，写法对齐 `fused_quant_scatter_copy_sparse_flash_attention` 的 `UnionCopy()` |
 | `srcTokenId → dram_block_table → (physicalBlock*128 + offset)` | `src_rows` / `dst_rows` 两张行表（`table_mode=1`） |
 | 每个 token 两次 `DataCopyPad`：CKV 1024B + KPE 128B | 不变（`group_rows=1` 时完全一致） |
 | `usedCoreNum * 2` 个 AIV 按 `blockIdx + k*usedCoreNum` 取任务 | `cores` 个 AIV 按 group 步进取任务 |
@@ -28,7 +28,7 @@ DRAM src ──MTE2 DataCopyPad──▶ UB bank[i] ──MTE3 DataCopyPad──
 
 ## 编译
 
-算子已加入 `csrc/build_aclnn.sh` 的 `ascend910b` / `ascend910_93` 算子列表。
+算子已加入 `csrc/build_aclnn.sh` 的 `ascend910b` / `ascend910_93` / `ascend950` 算子列表。
 
 `build_aclnn.sh` 的签名是 `bash build_aclnn.sh [ROOT_DIR] [SOC_VERSION]`，两个参数都可以省略：
 `ROOT_DIR` 默认取脚本所在目录的上一级，`SOC_VERSION` 默认读同名环境变量。
@@ -52,7 +52,7 @@ VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench bash csrc/build_aclnn.sh
 
 - 旧的报错 `ROOT_DIR is not set` 就是因为 `ROOT_DIR=$1` 而没传参；现在裸跑也能用。
 - `SOC_VERSION` 用**芯片级**名字（`npu-smi info -t board -i 0 -c 0` 的 Chip Name），
-  脚本按前缀选算子列表：`ascend910b*` → 910B，`ascend910_93*` → A3。
+  脚本按前缀选算子列表：`ascend910b*` → 910B，`ascend910_93*` → A3，`ascend950*` → A5。
 - 建议统一用 `bash`；用 `sh` 调用时脚本会自己 `exec bash` 重启一次，但仍以 `bash` 为准。
 - `VLLM_ASCEND_CUSTOM_OPS` 是给调试用的覆盖开关，默认不设置时行为完全不变。
   安装 run 包前会清空 `vllm_ascend/_cann_ops_custom`，所以只编一个算子时其余算子会
@@ -79,8 +79,32 @@ COMPILE_CUSTOM_KERNELS=0 pip install -e . --no-build-isolation # 2. 重编 vllm_
 （默认它是 1，会先把全量算子再编一次）。第 2 步只改了 `torch_binding.cpp` /
 新算子目录时是增量编译，通常一两分钟。
 
-## 运行
+### ascend950 / A5
 
+A5 没有 Vector 参与的纯拷贝用的是 `TQue<QuePosition::VECIN>` + 显式 fence，而不是
+`TQueBind`；本算子已按这个写法实现，所以 910B/A3/A5 共用同一份 kernel 源码（不需要
+`_apt.cpp` 和 `opFile.value`，`fused_quant_scatter_copy_sparse_flash_attention` 这个
+950 专用算子也是单 `.cpp`）：
+
+```bash
+# 全量 950（会生成 csrc/build/autogen/inner/aic-ascend950-ops-info.ini）
+SOC_VERSION=ascend950 bash csrc/build_aclnn.sh "$PWD" ascend950
+
+# 只编这个算子：它自己就是 950 可用的 aclnn_inner 算子，所以子集也能生成上面那个 ini
+SOC_VERSION=ascend950 VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
+    bash csrc/build_aclnn.sh "$PWD" ascend950
+```
+
+两个 A5 上需要注意的语义差异：
+
+- `CopyOut` 末尾有 `SetFlag/WaitFlag<MTE3_MTE2>` 再 `FreeTensor`，即每个 bank 的写回
+  完成后才释放。生产代码的 source-gather 路径也是这么做的。因此 `bank_num` 在 A5 上
+  主要影响 **MTE2 预取深度**，MTE3 是逐 bank 串行排空的；要测极致写侧流水请改用
+  `UnionCopy()` 那种「每 slot 一对 `AllocEventID`」的写法。
+- tiling 用 `GetCoreNumAiv()` 定核，`KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)`
+  让 A5 不配 AIC，所以 `--cores` 就是真实 AIV 数，不像生产的 MIX kernel 还要乘 2。
+
+## 运行
 ```bash
 # 生产配置：2 bank、每 token 一次 DMA、走行表寻址
 python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 --verify
