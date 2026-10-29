@@ -167,18 +167,20 @@ private:
         // The queue type depends on the class template parameter BANK_COUNT, so
         // the member template has to be disambiguated with `template`.
         LocalTensor<T> local = copyQueue_.template AllocTensor<T>();
-        // Always spell out every field: DataCopyPadExtParams is a plain struct,
-        // so a bare `DataCopyPadExtParams<T> padParams;` leaves isPad and the
-        // padding counts as UB stack garbage. A garbage isPad=true turns the
-        // transfer into padded mode with random left/right padding, which
-        // corrupts part of the row and differs from launch to launch -- exactly
-        // the "passes once, fails the next run" symptom. Every other kernel in
-        // this repo initialises it explicitly for the same reason.
+        // Spell every field out. DataCopyPadExtParams does have a default
+        // constructor that zero-initialises, but relying on it means a future
+        // CANN that drops the constructor silently leaves isPad at whatever the
+        // UB stack held, and a stray isPad=true turns the transfer into padded
+        // mode with random left/right padding. Every other kernel in this repo
+        // passes the four fields explicitly; do the same.
         DataCopyPadExtParams<T> padParams{false, static_cast<uint8_t>(0), static_cast<uint8_t>(0),
                                           static_cast<T>(0)};
-        // Zero-initialised as well: every field is overwritten below, but an
-        // aggregate init keeps any member a future CANN version adds at zero.
-        DataCopyExtParams params{1, 0, 0, 0};
+        // DataCopyExtParams is not an aggregate in CANN 9.2.0: it declares
+        //   DataCopyExtParams(uint16_t blockCount, uint32_t blockLen,
+        //                     uint32_t srcStride, uint32_t dstStride, uint32_t rsv)
+        // so all five arguments must be given (the fifth is the reserved field
+        // that kernels in this repo also pass explicitly as 0).
+        DataCopyExtParams params{1, 0, 0, 0, 0};
         params.blockCount = 1;
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
         params.srcStride = 0;
@@ -210,7 +212,8 @@ private:
     __aicore__ inline void CopyOut(uint32_t slot)
     {
         LocalTensor<T> local = copyQueue_.template DeQue<T>();
-        DataCopyExtParams params{1, 0, 0, 0};
+        // five arguments: blockCount, blockLen, srcStride, dstStride, rsv
+        DataCopyExtParams params{1, 0, 0, 0, 0};
         params.blockCount = 1;
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
         params.srcStride = 0;
