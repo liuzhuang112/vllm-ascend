@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import os
 import statistics
 import sys
 from dataclasses import dataclass
@@ -83,6 +84,14 @@ OP_NAME = "scatter_copy_ub_bench"
 HOST_ALIGN_BYTES = 64 * 1024
 ACL_HOST_REG_MAPPED = 0x2
 ACL_HOST_REG_PINNED = 0x10000000
+# torch_npu's pinned allocator only maps its pages into the device address space
+# when this option is on; without it aclrtHostGetDevicePointer fails and
+# get_npu_view_from_cpu_tensor returns None. tests/.../test_uva_view.py gates
+# itself on exactly this string. The option is parsed while torch_npu initialises,
+# so it has to be set before the import.
+ALLOC_CONF_ENV = "PYTORCH_NPU_ALLOC_CONF"
+PINNED_REGISTER_OPT = "pinned_mem_register:True"
+_alloc_conf_added = False
 REBUILD_BINDING = (
     "  build the torch binding; the kernel package alone does not register it:\n"
     "    SOC_VERSION=<soc> VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \\\n"
@@ -164,8 +173,6 @@ def _import_extension() -> None:
 
 def _warn_if_kernel_package_missing() -> None:
     """The binding is only half of it: the aclnn kernel must be loadable too."""
-    import os
-
     import vllm_ascend
 
     vendor = os.path.join(
@@ -183,8 +190,28 @@ def _warn_if_kernel_package_missing() -> None:
         )
 
 
+def _request_mapped_pinned_memory() -> None:
+    """Turn on ``pinned_mem_register:True`` before torch_npu is imported.
+
+    ``torch.pin_memory()`` only locks pages; ``get_npu_view_from_cpu_tensor``
+    needs the range to be mapped for the device, which torch_npu does only when
+    ``PYTORCH_NPU_ALLOC_CONF`` carries ``pinned_mem_register:True``. Without it
+    the view is ``None`` no matter how the tensor was allocated.
+    """
+    global _alloc_conf_added
+
+    conf = os.environ.get(ALLOC_CONF_ENV, "").strip()
+    if PINNED_REGISTER_OPT in conf:
+        return
+    os.environ[ALLOC_CONF_ENV] = f"{conf},{PINNED_REGISTER_OPT}" if conf else PINNED_REGISTER_OPT
+    _alloc_conf_added = True
+
+
 def _load_runtime():
     global torch_npu
+    # Must run before the import below: torch_npu reads the allocator options
+    # while it initialises.
+    _request_mapped_pinned_memory()
     import torch_npu as _torch_npu
 
     torch_npu = _torch_npu
@@ -289,56 +316,80 @@ class Bench:
     def _publish_host_source(self, values: torch.Tensor, rows: int, dim: int):
         """Return (device view, host copy) of a host buffer the NPU can read.
 
-        ``pin_memory()`` alone is not enough: ``get_npu_view_from_cpu_tensor``
-        calls ``aclrtHostGetDevicePointer``, which only succeeds for a range
-        allocated by ``aclrtMallocHost`` or registered with
-        ``aclrtHostRegisterV2(ACL_HOST_REG_MAPPED)``. A merely pinned buffer
-        therefore comes back as ``None``. This mirrors
-        ``vllm_ascend/models/deepseek_v41/engram/npu.py::HostUvaBuffer``, which
-        is the way this repo publishes host memory to the device.
+        Two things are needed and only the second one is optional:
+
+        1. the buffer must be pinned *and registered for device access* -- with
+           ``pinned_mem_register:True`` in ``PYTORCH_NPU_ALLOC_CONF`` (set by
+           ``_request_mapped_pinned_memory``) torch_npu's own allocator does the
+           registration, which is the path ``tests/.../test_uva_view.py``
+           exercises;
+        2. a 64 KiB aligned payload, because unaligned device reads of host
+           memory were observed to return wrong data on A3 / CANN 9.2 (see
+           ``engram/npu.py::HostUvaBuffer``).
+
+        If the allocator option did not take effect (torch_npu was already
+        imported before this script ran) the range is registered here instead,
+        mirroring HostUvaBuffer.
         """
         elt = values.element_size()
         # Over-allocate so the payload starts on a 64 KiB boundary. The whole
-        # storage is registered, so the view's storage_offset stays reachable
-        # and aclrtHostGetDevicePointer(storage base) remains valid.
+        # storage is registered, so the view's storage_offset stays reachable and
+        # aclrtHostGetDevicePointer(storage base) remains valid.
         slack = HOST_ALIGN_BYTES // elt
         raw = torch.empty(rows * dim + slack, dtype=self.case.dtype, pin_memory=True)
         if not raw.is_pinned():
             raise SystemExit(
-                "torch pin_memory() returned an ordinary CPU buffer, so this "
-                "buffer cannot be published to the device. Check the torch_npu "
-                "pinned allocator on this machine, or run without --src host."
+                "torch pin_memory() returned an ordinary CPU buffer, so it cannot "
+                "be published to the device. Check the torch_npu pinned allocator "
+                "on this machine, or run without --src host."
             )
         offset = ((-raw.data_ptr()) % HOST_ALIGN_BYTES) // elt
         payload = raw.narrow(0, offset, rows * dim).view(rows, dim)
         payload.copy_(values)
 
-        lib = _acl_runtime()
-        flags = _host_register_flags()
+        view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(payload)
+        if view is not None:
+            return view, payload
+
+        # Fallback: publish the pinned range ourselves.
         base = raw.data_ptr()
         size = raw.numel() * elt
-        rc = lib.aclrtHostRegisterV2(ctypes.c_void_p(base), size, flags)
-        if rc == 0:
-            self._host_regions.append((base, size, raw))
-
-        view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(payload)
-        if view is None:
-            dev_ptr = ctypes.c_void_p()
-            rc_dev = lib.aclrtHostGetDevicePointer(ctypes.c_void_p(payload.data_ptr()),
-                                                   ctypes.byref(dev_ptr), 0)
+        flags = _host_register_flags()
+        rc = -1
+        rc_dev = -1
+        try:
+            lib = _acl_runtime()
+        except OSError as exc:
+            lib = None
+            print(f"warning: libascendcl.so not loadable ({exc})", file=sys.stderr)
+        if lib is not None:
+            rc = lib.aclrtHostRegisterV2(ctypes.c_void_p(base), size, flags)
             if rc == 0:
+                self._host_regions.append((base, size, raw))
+                view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(payload)
+                if view is not None:
+                    return view, payload
+                dev_ptr = ctypes.c_void_p()
+                rc_dev = lib.aclrtHostGetDevicePointer(
+                    ctypes.c_void_p(payload.data_ptr()), ctypes.byref(dev_ptr), 0
+                )
                 lib.aclrtHostUnregister(ctypes.c_void_p(base))
                 self._host_regions.clear()
-            raise SystemExit(
-                "the host source could not be published to the device:\n"
-                f"  aclrtHostRegisterV2 rc={rc} flags=0x{flags:x}\n"
-                f"  aclrtHostGetDevicePointer rc={rc_dev}\n"
-                "  on A5 only ACL_HOST_REG_MAPPED is accepted (PINNED fails with "
-                "107000); DeviceOperator.host_register_flags() already picks the "
-                "right value, so a non-zero register rc means the runtime refuses "
-                "the range itself. Run without --src host to measure HBM->HBM."
-            )
-        return view, payload
+
+        raise SystemExit(
+            "the host source could not be published to the device:\n"
+            f"  pinned={bool(raw.is_pinned())}, alloc_conf={os.environ.get(ALLOC_CONF_ENV, '')!r}"
+            f", alloc_conf_added_by_us={_alloc_conf_added}\n"
+            f"  aclrtHostRegisterV2 rc={rc} flags=0x{flags:x}\n"
+            f"  aclrtHostGetDevicePointer rc={rc_dev}\n"
+            "  if alloc_conf_added_by_us is False, this script could not add "
+            "pinned_mem_register:True (torch_npu was already imported), so the "
+            "pinned pages were never mapped. Export it and rerun:\n"
+            f"    export {ALLOC_CONF_ENV}={PINNED_REGISTER_OPT}\n"
+            "  a non-zero register rc means the runtime refused the range itself "
+            "(A5 takes only ACL_HOST_REG_MAPPED; PINNED fails with 107000).\n"
+            "  run without --src host to measure HBM->HBM instead."
+        )
 
     def close(self) -> None:
         """Unregister the host sources, never while a launch may still read them."""

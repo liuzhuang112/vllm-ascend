@@ -196,7 +196,9 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --sweep bank
 # 扫描：行表标量读的代价（table_mode=1 vs 0）
 python benchmarks/kernel/scatter_copy_ub_bench.py --sweep table-mode
 
-# 真实 DRAM → HBM（源在 host pinned 内存，经 UVA 映射给 device）
+# 真实 DRAM → HBM（源在 host 锁页内存，经 UVA 映射给 device）
+# 脚本会自己把 pinned_mem_register:True 加进 PYTORCH_NPU_ALLOC_CONF；
+# 若 torch_npu 已被提前 import，则先手动 export 该变量再运行。
 python benchmarks/kernel/scatter_copy_ub_bench.py --src host --verify
 ```
 
@@ -261,13 +263,21 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
   写侧允许任意正向步长，与生产里 miss pair 的合并写一致。随机行表下会退化成逐行 DMA，
   这正是我们想看到的「合并能不能用」的结论。
 - `--cores` 超过实际 AIV 数时会在 tiling 里被截断，标签仍显示请求值。
-- host 源依赖 `get_npu_view_from_cpu_tensor`（`aclrtHostGetDevicePointer` 的映射视图），普通可分页 CPU 内存不受支持。
-  **`torch.pin_memory()` 不够**：它只锁页，不会把这段内存发布给 device，所以该接口会返回 `None`
-  （报错 `the host buffer is not registered for device access`）。必须先
-  `aclrtHostRegisterV2(ptr, size, flags)` 注册，再取 device 地址；flags 在 **A5 上只能给
-  `ACL_HOST_REG_MAPPED`**（带 PINNED 会被拒，错误码 107000），A2/A3 是
-  `MAPPED|PINNED`。脚本现在按 `DeviceOperator.host_register_flags()` 自动选，并把 payload
-  对齐到 64KiB（同 `models/deepseek_v41/engram/npu.py` 的 `HostUvaBuffer`），跑完
+- `--src host` 依赖 `get_npu_view_from_cpu_tensor`（`aclrtHostGetDevicePointer` 的映射视图）。
+  **开关是 `PYTORCH_NPU_ALLOC_CONF=pinned_mem_register:True`**：torch_npu 的 pinned 分配器
+  只有开了这个选项才会把锁页内存映射进 device 地址空间；没开时 `pin_memory()` 只锁页，
+  `aclrtHostGetDevicePointer` 失败，接口返回 `None`（旧报错
+  `the host buffer is not registered for device access`）。这也是
+  `tests/e2e/nightly/single_node/ops/singlecard_ops/test_uva_view.py` 的 skip 条件
+  （`"pinned_mem_register:True" not in os.getenv("PYTORCH_NPU_ALLOC_CONF")`）。
+  脚本在 `import torch_npu` **之前**自动把它追加到该环境变量；如果 torch_npu 已经被别处
+  import（例如用 `python -c` 包装运行），追加不会生效，脚本会给出提示，此时手动
+  `export PYTORCH_NPU_ALLOC_CONF=pinned_mem_register:True` 再跑即可。
+- 兜底路径：若映射仍未生效，脚本会自己对锁页区间调 `aclrtHostRegisterV2(ptr, size, flags)`
+  （同 `models/deepseek_v41/engram/npu.py::HostUvaBuffer`）。flags 在 **A5 上只能给
+  `ACL_HOST_REG_MAPPED`**（带 PINNED 会被拒，错误码 107000），A2/A3 是 `MAPPED|PINNED`，
+  由 `DeviceOperator.host_register_flags()` 自动选。payload 会对齐到 64KiB（同
+  `HostUvaBuffer`，A3/CANN 9.2 上未对齐的 device 读回数据不正确），跑完
   `torch.npu.synchronize()` 后再 `aclrtHostUnregister`。
 - 计时为 host 侧 `torch.npu.Event` + N 次连续 launch，包含 launch 间隙；需要剔除
   调度开销时请配合 `msprof` 或 `torch_npu.profiler` 看单算子 task 时间。
