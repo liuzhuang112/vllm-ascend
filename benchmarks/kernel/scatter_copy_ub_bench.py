@@ -273,12 +273,14 @@ class Bench:
     def verify(self, sample: int = 64, repeats: int = 1) -> None:
         """Compare the copied rows against the source, and report *how* they differ.
 
-        ``repeats > 1`` re-runs the op and re-checks every time, which is the
-        only way to catch a non-deterministic kernel: a launch that passes once
-        and fails later points at uninitialised state or a missing fence, not at
-        an addressing bug (that one fails every time, on the same rows).
+        ``sample=0`` checks every row. ``repeats > 1`` re-runs the op and
+        re-checks every time, which is the only way to catch a
+        non-deterministic kernel: a launch that passes once and fails later
+        points at a missing fence or uninitialised state, not at an addressing
+        bug (that one fails every time, on the same rows).
         """
-        sample = min(sample, self.case.rows)
+        total = self.case.rows
+        sample = total if sample <= 0 else min(sample, total)
         idx = torch.arange(sample, dtype=torch.int64)
         src_flat = self._source_cpu(self.src_kv_cpu, self.src_kv_dev)
         rope_flat = self._source_cpu(self.src_rope_cpu, self.src_rope_dev)
@@ -294,23 +296,34 @@ class Bench:
             bad_kv = (got_kv != want_kv).any(dim=1)
             bad_rope = (got_rope != want_rope).any(dim=1)
             if bool(bad_kv.any()) or bool(bad_rope.any()):
-                self._report_mismatch(attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
-                                      src_flat, rope_flat)
-                raise AssertionError(
-                    f"scatter_copy_ub_bench verify failed on attempt {attempt + 1}/{repeats} "
-                    f"(see the report above)"
+                summary = self._report_mismatch(
+                    attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope, src_flat
                 )
+                raise AssertionError(
+                    f"scatter_copy_ub_bench verify failed on attempt {attempt + 1}/{repeats}: {summary}"
+                )
+            print(
+                f"verify: attempt {attempt + 1}/{repeats} ok ({sample}/{total} rows, "
+                f"{self.case.bank} banks, group {self.case.group_rows}, table_mode {self.case.table_mode})",
+                flush=True,
+            )
 
     def _report_mismatch(self, attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
-                         src_flat, rope_flat) -> None:
+                         src_flat) -> str:
+        """Print one block per bad row and return a one-line summary.
+
+        The summary is also embedded in the raised AssertionError, so the
+        diagnosis survives a log that keeps only the traceback.
+        """
         rows = torch.nonzero(bad_kv | bad_rope).flatten().tolist()
         total_kv = int((got_kv != want_kv).sum())
         total_rope = int((got_rope != want_rope).sum())
         print(
             f"\nverify: attempt {attempt + 1}/{repeats} mismatched {len(rows)}/{got_kv.shape[0]} sampled rows "
-            f"(kv {total_kv} elems, rope {total_rope} elems; rows {rows[:8]})",
-            file=sys.stderr,
+            f"(kv {total_kv} elems, rope {total_rope} elems; first rows {rows[:8]})",
+            flush=True,
         )
+        first = ""
         for r in rows[:4]:
             dst_tok = int(self.dst_rows[r])
             src_tok = int(self.src_rows[r])
@@ -325,12 +338,20 @@ class Bench:
                 hint = f"payload equals source row(s) {hits[:4].tolist()} (expected {src_tok})"
             elif bool((got == 0).all()):
                 hint = "all zeros -> row never written"
+            span = f"[{int(cols[0])}..{int(cols[-1])}]" if cols.numel() else "none"
+            rope_bad = bool((got_rope[r] != want_rope[r]).any())
             print(
                 f"  sample row {r}: dst_tok={dst_tok} src_tok={src_tok}, "
-                f"kv bad {cols.numel()}/{want.numel()} cols [{int(cols[0])}..{int(cols[-1])}], "
-                f"rope {'bad' if bool((got_rope[r] != want_rope[r]).any()) else 'ok'} | {hint}",
-                file=sys.stderr,
+                f"kv bad {cols.numel()}/{want.numel()} cols {span}, "
+                f"rope {'bad' if rope_bad else 'ok'} | {hint}",
+                flush=True,
             )
+            if not first:
+                first = (
+                    f"sample row {r} dst_tok={dst_tok} src_tok={src_tok}, kv bad "
+                    f"{cols.numel()}/{want.numel()} cols {span}, rope {'bad' if rope_bad else 'ok'}, {hint}"
+                )
+        return f"{len(rows)}/{got_kv.shape[0]} sampled rows bad; {first}"
 
     def _source_cpu(self, host, view):
         return host if host is not None else view.cpu()
@@ -373,6 +394,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--verify", action="store_true", help="check copied rows before timing")
+    parser.add_argument(
+        "--verify-rows",
+        type=int,
+        default=64,
+        help="rows to check with --verify (0 = every row; a full sweep is the only way to prove "
+        "that every owning core wrote its share)",
+    )
     parser.add_argument(
         "--repeat-verify",
         type=int,
@@ -428,7 +456,7 @@ def main(argv=None) -> int:
     for label, case in points:
         bench = Bench(case)
         if args.verify:
-            bench.verify(repeats=max(1, args.repeat_verify))
+            bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
         us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
         gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
         print(

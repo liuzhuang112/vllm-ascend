@@ -9,15 +9,18 @@
  *     DRAM src  --MTE2 DataCopyPad-->  UB bank  --MTE3 DataCopyPad-->  HBM dst
  *
  * Only the copy is kept. There is no vector compute, so the two transfers are
- * the whole pipeline: a TQue<VECIN> queue of `bank_num` slots keeps
- * `bank_num - 1` reads in flight while the oldest bank drains to HBM, which is
- * exactly the software pipeline used by FirstFillScatterCopyKernel.
+ * the whole pipeline: a queue of `bank_num` slots keeps `bank_num - 1` reads in
+ * flight while the oldest bank drains to HBM, which is exactly the software
+ * pipeline used by FirstFillScatterCopyKernel.
  *
- * The queue is a plain VECIN queue rather than a TQueBind: the A5 (arch35)
- * kernels never use TQueBind, they allocate a VECIN buffer, fill it with MTE2,
- * write it out with MTE3 and then fence MTE3_MTE2 before releasing it. Both the
- * standalone UnionCopy() scatter of the A5 fused op and its per-token
- * source-gather path do exactly that, so this file follows them.
+ * The queue is a TQueBind<VECIN, VECOUT>: the buffer is a VECIN input for MTE2
+ * and a VECOUT output for MTE3, so releasing it inserts the MTE3_MTE2 edge.
+ * That edge is the whole correctness requirement here -- with a bare
+ * TQue<VECIN> the release would wait on V_MTE2 ("vector consumed it"), which
+ * retires immediately in a kernel that never issues a vector op, so MTE2 could
+ * refill a bank while MTE3 was still draining it. Both A5 (arch35) copy paths
+ * in this repo use TQueBind for the same reason: moe/scatter_nd_update_sk and
+ * the production first_fill_scatter_copy kernel.
  *
  * Differences from the production kernel (all of them are knobs here):
  *   - bank_num / group_rows / core_num are runtime parameters instead of
@@ -90,11 +93,6 @@ public:
         // Group-strided ownership: core c owns groups c, c + coreNum, ... so a
         // group's rows stay adjacent and remain coalescible.
         groups_ = CeilDiv(totalGroups_ - coreIdx_, static_cast<int64_t>(usedCoreNum_));
-
-        // Fetched once per launch, not once per group: the id is reused by a
-        // serially executed SetFlag/WaitFlag pair, so a single id is enough and
-        // the event pool is never churned.
-        writeDoneEvent_ = static_cast<event_t>(pipe_->FetchEventID(HardEvent::MTE3_MTE2));
 
         const int64_t lookahead = static_cast<int64_t>(bankNum_) - 1;
         for (int64_t k = 0; k < lookahead && k < groups_; ++k) {
@@ -240,11 +238,11 @@ private:
                             local[kpeOffsetElems_ + r * kpeDim_], params);
             }
         }
-        // MTE3 drains the bank asynchronously, so the queue must not hand the
-        // buffer back to MTE2 before the store retires. This is the fence the
-        // production A5 copy paths use before they release a VECIN buffer.
-        SetFlag<HardEvent::MTE3_MTE2>(writeDoneEvent_);
-        WaitFlag<HardEvent::MTE3_MTE2>(writeDoneEvent_);
+        // FreeTensor returns the bank to MTE2 only after the TQueBind has
+        // fenced MTE3_MTE2 (VECOUT consumer -> VECIN producer), so no manual
+        // SetFlag/WaitFlag is needed here -- and none is used on purpose: a
+        // hand-fetched event id can collide with the one the queue reserves
+        // for the same HardEvent.
         copyQueue_.FreeTensor(local);
     }
 
@@ -256,9 +254,16 @@ private:
     GlobalTensor<T> dstRopeGm_;
     GlobalTensor<int32_t> srcRowsGm_;
     GlobalTensor<int32_t> dstRowsGm_;
-    // VECIN rather than TQueBind: see the file header. The element type is a
-    // tiling field, so both instantiations below exist in one binary.
-    TQue<QuePosition::VECIN, BANK_COUNT> copyQueue_;
+    // VECIN buffers are released by TQueBind on the MTE3_MTE2 edge, because the
+    // dst position is VECOUT: that is the sync this pipeline needs. A bare
+    // TQue<QuePosition::VECIN> would release on V_MTE2 instead ("vector has
+    // consumed the buffer"), and with no vector op in this kernel that flag
+    // retires immediately, letting MTE2 overwrite a bank MTE3 is still
+    // draining. Both A5 (arch35) copy paths in this repo --
+    // moe/scatter_nd_update_sk and the production first_fill_scatter_copy
+    // kernel -- therefore use TQueBind<VECIN, VECOUT> here, and neither adds a
+    // manual SetFlag/WaitFlag pair.
+    TQueBind<QuePosition::VECIN, QuePosition::VECOUT, BANK_COUNT> copyQueue_;
 
     int64_t coreIdx_ = 0;
     int64_t numTokens_ = 0;
@@ -271,7 +276,6 @@ private:
     int64_t tableMode_ = 0;
     uint32_t bankNum_ = 2;
     uint32_t usedCoreNum_ = 1;
-    event_t writeDoneEvent_ = static_cast<event_t>(EVENT_ID0);
 
     // Destination rows of each in-flight group, plus the two coalescing
     // decisions. This is the only scalar state the pipeline carries.

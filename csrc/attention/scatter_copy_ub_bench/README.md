@@ -210,6 +210,33 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --src host --verify
 
 `GB/s = rows × 1152B / 时延`，即只统计有效载荷（读 1152B + 写 1152B 的实际带宽约为此值的 2 倍）。
 
+## 校验（`--verify`）
+
+```bash
+# 全量校验 + 重复 20 次：抓非确定性（fence 缺失这类 bug 只会偶发）
+python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --repeat-verify 20 \
+    --iters 1 --rounds 1
+```
+
+`--verify-rows` 默认只查前 64 行，`0` 表示查全部。**非确定性 bug 用全量 + 重复才能定住**：
+每核负责的组是 `c, c + coreNum, ...`，只查前 64 行会漏掉大部分核。
+
+失败时每个坏行会打印一行诊断，并给出三种归因：
+
+| 报告 | 含义 |
+|:---|:---|
+| `payload equals source row(s) X` | 写到了错误的 token → 行表/寻址错 |
+| `all zeros -> row never written` | 该行完全没写 → 拥有它的核没跑到，或 DMA 没发 |
+| `no other source row matches -> torn or stale DMA` | 半行对半行错 → 搬运被覆盖/撕裂，同步问题 |
+
+最后一种基本只有一个来源：MTE2 提前复用了 MTE3 还在读的 UB bank。kernel 里的队列因此是
+`TQueBind<QuePosition::VECIN, QuePosition::VECOUT, N>` —— 释放 buffer 时走 MTE3_MTE2 这条边；
+裸 `TQue<VECIN>` 释放时等的是 `V_MTE2`（“vector 读完了”），而这个 kernel 一条 vector 指令都没有，
+该 flag 立刻成立，MTE2 就会踩上去。
+
+定位手段：`--bank 1` 关掉流水（同一 slot 读完即写、无重叠）。`--bank 1` 全过而 `--bank 2` 偶发失败，
+就锁定在 bank 复用/同步上；两者都错则与重叠无关，往寻址方向查。
+
 ## 参数含义
 
 | 参数 | 作用 | 建议扫描范围 |
@@ -220,6 +247,8 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --src host --verify
 | `--table-mode` | `1` = 走行表 `GetValue`（同生产）；`0` = 恒等寻址 | 0 / 1 |
 | `--cores` | 启动的 AIV 数，`0` = 全部 | 8 / 16 / 24 / 48 |
 | `--src` | `npu` = 源在 HBM；`host` = 源在 host pinned 内存 | npu / host |
+| `--verify-rows` | 校验多少行，`0` = 全部 | 64 / 0 |
+| `--repeat-verify` | 重复跑并重复校验的次数（抓偶发） | 20 |
 
 `--table-mode 0` 与 `--table-mode 1` 的差值，就是**每行两次 `GlobalTensor::GetValue`
 标量读**的代价。生产 kernel 里这部分开销与 DMA 是串行的，通常就是 ScatterCopy 时延里
