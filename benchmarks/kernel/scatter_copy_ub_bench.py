@@ -63,6 +63,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import os
+import shutil
 import statistics
 import sys
 from dataclasses import dataclass
@@ -92,6 +93,8 @@ ACL_HOST_REG_PINNED = 0x10000000
 ALLOC_CONF_ENV = "PYTORCH_NPU_ALLOC_CONF"
 PINNED_REGISTER_OPT = "pinned_mem_register:True"
 _alloc_conf_added = False
+# Set by the re-exec below so the restarted process does not restart again.
+INTERLEAVE_ENV = "SCATTER_COPY_UB_INTERLEAVED"
 REBUILD_BINDING = (
     "  build the torch binding; the kernel package alone does not register it:\n"
     "    SOC_VERSION=<soc> VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \\\n"
@@ -205,6 +208,40 @@ def _request_mapped_pinned_memory() -> None:
         return
     os.environ[ALLOC_CONF_ENV] = f"{conf},{PINNED_REGISTER_OPT}" if conf else PINNED_REGISTER_OPT
     _alloc_conf_added = True
+
+
+def _reexec_interleaved(argv: list[str]) -> None:
+    """Restart the script under ``numactl --interleave=all``.
+
+    A host buffer whose pages all come from one NUMA node is reachable through
+    one host link, which is what a 950 with two UB ports shows up as: the run
+    saturates a single port no matter how many AIV cores issue the DMA. Spreading
+    the pages over every node is the cheapest way to put half of the source
+    behind each port, and it has to happen before the allocation, hence the
+    re-exec rather than a call in ``Bench``.
+
+    Verify the effect with ``benchmarks/kernel/ub_port_probe.py``; if the pages
+    were already interleaved, or the allocator ignores the task mempolicy, the
+    probe will still show one port and the split has to be done in the kernel
+    instead (two registered windows, chosen per row).
+    """
+    if os.environ.get(INTERLEAVE_ENV) == "1":
+        return
+    numactl = shutil.which("numactl")
+    if numactl is None:
+        print(
+            "warning: --host-interleave needs numactl, which is not installed; "
+            "host pages stay on a single NUMA node and only one host link will "
+            "be used",
+            file=sys.stderr,
+        )
+        return
+    os.environ[INTERLEAVE_ENV] = "1"
+    print(f"note: restarting under {numactl} --interleave=all", file=sys.stderr)
+    os.execv(
+        numactl,
+        [numactl, "--interleave=all", sys.executable, os.path.abspath(__file__), *argv],
+    )
 
 
 def _load_runtime():
@@ -536,6 +573,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--table-mode", type=int, default=1, help="1 = gather/scatter via row tables, 0 = identity")
     parser.add_argument("--cores", type=int, default=0, help="AIV blocks to launch, 0 = all")
     parser.add_argument("--src", choices=("npu", "host"), default="npu", help="source placement")
+    parser.add_argument(
+        "--host-interleave",
+        action="store_true",
+        help="with --src host, restart under numactl --interleave=all so the source pages "
+        "span every NUMA node (one host link per node: this is what uses both UB ports)",
+    )
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=200)
@@ -575,6 +618,10 @@ def sweep_values(name: str) -> list:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if args.host_interleave and argv is None:
+        if args.src != "host":
+            print("note: --host-interleave only affects --src host", file=sys.stderr)
+        _reexec_interleaved(sys.argv[1:])
     _load_runtime()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 

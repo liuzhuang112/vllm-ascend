@@ -249,12 +249,71 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | `--table-mode` | `1` = 走行表 `GetValue`（同生产）；`0` = 恒等寻址 | 0 / 1 |
 | `--cores` | 启动的 AIV 数，`0` = 全部 | 8 / 16 / 24 / 48 |
 | `--src` | `npu` = 源在 HBM；`host` = 源在 host pinned 内存 | npu / host |
+| `--host-interleave` | 配合 `--src host`：以 `numactl --interleave=all` 重启，让源页跨 NUMA node（两个 host 口的场景） | 开关 |
 | `--verify-rows` | 校验多少行，`0` = 全部 | 64 / 0 |
 | `--repeat-verify` | 重复跑并重复校验的次数（抓偶发） | 20 |
 
 `--table-mode 0` 与 `--table-mode 1` 的差值，就是**每行两次 `GlobalTensor::GetValue`
 标量读**的代价。生产 kernel 里这部分开销与 DMA 是串行的，通常就是 ScatterCopy 时延里
 最容易被忽略的一块。
+
+## 怎么让 host 侧的 2 个 UB 口一起工作
+
+典型读数：`--src npu` 130 GB/s、`--src host` 42 GB/s。42 GB/s 正好落在**单条**高速链路
+的饱和区（PCIe Gen5 x16 有效 ~50、400G 类口 ~45–47），所以第一步不是改 kernel，而是
+确认到底有几个口在动。
+
+**1) 先量硬件上限，再判断我们离它多远**
+
+```bash
+# 厂商工具给的是不经过 kernel 的 h2d 上限；它若 ~84 GB/s 而我们的 kernel 只有 42，
+# 说明瓶颈在 kernel 一侧的 DMA 发起方式，而不是链路
+ascend-dmi -bw -d 0 --type h2d -q
+```
+
+**2) 数清楚本次运行用了几个口**（`benchmarks/kernel/ub_port_probe.py` 会前后采样所有
+`hccn_tool` 口与 `/sys/class/net/*` 计数器，打印每口的增量与 GB/s）
+
+```bash
+python benchmarks/kernel/ub_port_probe.py -- \
+    python benchmarks/kernel/scatter_copy_ub_bench.py --src host --iters 2000 --rounds 1
+```
+
+只有一行为非零 = 单口跑满；两行各占一半 = 两个口都用了。
+
+**3) 让 host 页跨 NUMA node 分布（最省事的一个杠杆）**
+
+单口跑满通常是因为源页全落在一个 NUMA node 上，而每个 node 各对应一个 host 口：
+
+```bash
+python benchmarks/kernel/scatter_copy_ub_bench.py --src host --host-interleave
+# 等价于 numactl --interleave=all python benchmarks/kernel/scatter_copy_ub_bench.py --src host
+```
+
+`--host-interleave` 会在分配源之前用 `numactl --interleave=all` 重启自己（mempolicy 必须
+早于分配），此时两个 node 的页各承担一半读流量。若分配器忽略 task mempolicy（不影响本
+脚本里的 pinned 分配），回到第 2 步会看到仍然只有一个口。
+
+**4) 拆进程验证“是不是单实例上限”**
+
+```bash
+numactl --cpunodebind=0 --membind=0 python benchmarks/kernel/scatter_copy_ub_bench.py \
+    --src host --rows 1024 --iters 2000 --rounds 1
+numactl --cpunodebind=1 --membind=1 python benchmarks/kernel/scatter_copy_ub_bench.py \
+    --src host --rows 1024 --iters 2000 --rounds 1
+```
+
+两个进程同时跑：各自 ~42 → 合计 ~84，说明两条链路可用、只是单实例走不到第二条，才值得
+改 kernel；两个加起来仍 ~42 → 瓶颈在共用资源（host 侧 UB 适配器 / 单卡 DMA 通道），改
+kernel 无意义。
+
+**5) 真要到改 kernel 时，方向是“两个注册窗口”**
+
+现在的 `--src host` 只有**一个**源指针，所有行都从同一段 host 区间读；即使页已经跨 node，
+地址位落在一个连续区间里仍可能被路由到同一个口。要稳定用满两条，最小改动是给算子加第二个
+源指针：分配两段锁页内存、分别注册（各自 `aclrtHostGetDevicePointer`），kernel 按
+`row_bit = row & 1`（或按核号奇偶）选基址。这样每核的读请求天然分到两段地址区间，
+不依赖分配器的页放置策略。
 
 ## 已知限制
 
