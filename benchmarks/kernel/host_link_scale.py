@@ -13,19 +13,21 @@ socket owns one host port (see ``npu_topology.py``). One process on one die can
 therefore only reach one port, so the useful test puts a process on a die from
 *each* group, bound to the NUMA node of its affinity range:
 
-    python benchmarks/kernel/host_link_scale.py --procs 2 --devices 0,4 --cores 20
+    python benchmarks/kernel/host_link_scale.py --procs 2 --devices 0,4
 
-Read the verdict at the end:
+Two runs are made and compared against the single-die baseline:
 
-    sum ~= N x single   the host path scales, so a single run cannot reach the
-                        ceiling; spreading the work over several dies (or two
-                        registered windows inside one kernel) buys bandwidth
-    sum ~= single       the host path or the shared adapter is already saturated
-                        at one instance, and no amount of parallelism helps
+    across groups   dies from two sockets -> uses two host ports
+    same group      two dies on one socket -> one port, two DMA engines
 
-AIV cores are the other way to accidentally serialize the launches: a kernel that
-asks for every core leaves none for the second process. Pass ``--cores`` to split
-them (e.g. 20 each on a 40-core device) when you want real overlap.
+That second run is what separates the two possible ceilings:
+
+    same group ~= 2 x single   the port can feed more than one die, so the
+                               per-die DMA engine is the limit; a single die
+                               cannot go faster, but more dies on that socket can
+    same group ~= single       the port itself is capped; only a second socket
+                               (or a second registered window onto its DRAM)
+                               adds bandwidth
 """
 
 from __future__ import annotations
@@ -140,6 +142,25 @@ def choose_devices(args, topo: list[dict]) -> list[int]:
     return devices
 
 
+def measure(devices: list[int], nodes: list[int | None], args, rows: int) -> list[float] | None:
+    cmds = [bench_cmd(args, rows, device) for device in devices]
+    results = run_concurrent(cmds, nodes)
+    if any(value is None for value in results):
+        return None
+    return [float(value) for value in results]  # type: ignore[arg-type]
+
+
+def print_run(title: str, devices: list[int], nodes: list[int | None], values: list[float]) -> None:
+    print(f"{title}")
+    print(f"{'proc':>5} {'npu':>4} {'node':>5} {'GB/s':>8}")
+    print("-" * 26)
+    for index, (value, device, node) in enumerate(zip(values, devices, nodes)):
+        print(f"{index:>5} {device:>4} {('-' if node is None else node):>5} {value:>8.1f}")
+    print("-" * 26)
+    print(f"{'sum':>5} {'':>4} {'':>5} {sum(values):>8.1f}")
+    print()
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -159,8 +180,8 @@ def main(argv=None) -> int:
         "--cores",
         type=int,
         default=0,
-        help="AIV blocks per process (0 = all). With several processes, 0 lets the "
-        "first one take every core and the rest queue -- pass a fraction instead",
+        help="AIV blocks per process (0 = all). Only processes that share a die compete "
+        "for cores, so 0 is fine when each process has its own die",
     )
     parser.add_argument(
         "--bind",
@@ -169,21 +190,24 @@ def main(argv=None) -> int:
         help="auto/topo = pin each process to the NUMA node of its die's affinity range "
         "(default); none = no numactl",
     )
+    parser.add_argument(
+        "--same-group",
+        dest="same_group",
+        action="store_true",
+        default=True,
+        help="also measure two dies on ONE socket, which tells a per-port ceiling from a "
+        "per-die one (default: on)",
+    )
+    parser.add_argument("--no-same-group", dest="same_group", action="store_false")
     parser.add_argument("--bench", default=BENCH, help="benchmark script to drive")
     args = parser.parse_args(argv)
 
     if not os.path.isfile(args.bench):
         parser.error(f"benchmark not found: {args.bench}")
-    if args.procs > 1 and args.cores == 0:
-        print(
-            "warning: --cores 0 means every process asks for all AIV cores, so the "
-            "launches will serialize and the total can never exceed one run.\n"
-            "  pass e.g. --cores 20 for two processes on a 40-AIV device.",
-            file=sys.stderr,
-        )
 
     topo_text = npu_topology.read_topo() if args.bind != "none" else None
     topo = npu_topology.parse_topo(topo_text) if topo_text else []
+    clusters = npu_topology.groups(topo) if topo else []
     if topo:
         print(npu_topology.summary(topo))
         print()
@@ -209,52 +233,99 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
 
+    if len(set(devices)) < len(devices):
+        print(
+            "warning: the same die appears twice in --devices; two processes on one die "
+            "contend for AIV cores and the second one mostly queues",
+            file=sys.stderr,
+        )
+
     single_node = nodes[0] if nodes else None
-    print(f"single: 1 process x {args.rows} rows on NPU{devices[0]}"
-          f"{'' if single_node is None else f' (numa node {single_node})'}")
+    where = "" if single_node is None else f" (numa node {single_node})"
+    print(f"baseline: 1 process, NPU{devices[0]}, {args.rows} rows{where}")
     single = run_sequential(bench_cmd(args, args.rows, devices[0]), single_node)
     if single is None:
         print("baseline run failed; nothing to compare", file=sys.stderr)
         return 1
-    print(f"  {single:.1f} GB/s")
+    print(f"  {single:.1f} GB/s\n")
 
     # Keep the total payload comparable to the baseline so the per-run fixed costs
     # do not flatter the concurrent case.
     total_rows = args.rows * args.procs
     per_proc_rows = total_rows // args.procs
-    print(f"\nconcurrent: {args.procs} processes x {per_proc_rows} rows")
-    cmds = [bench_cmd(args, per_proc_rows, device) for device in devices]
-    results = run_concurrent(cmds, nodes)
-    if any(r is None for r in results):
-        print("at least one concurrent run failed", file=sys.stderr)
-        return 1
 
-    print(f"{'proc':>5} {'npu':>4} {'node':>5} {'GB/s':>8}")
-    print("-" * 26)
-    for index, (value, device, node) in enumerate(zip(results, devices, nodes)):
-        print(f"{index:>5} {device:>4} {('-' if node is None else node):>5} {value:>8.1f}")
-    total = sum(r for r in results if r is not None)
-    print("-" * 26)
-    print(f"{'sum':>5} {'':>4} {'':>5} {total:>8.1f}   (single run: {single:.1f} GB/s, x{total / single:.2f})")
-    print()
-    if total >= single * 1.5:
+    across = measure(devices, nodes, args, per_proc_rows)
+    if across is None:
+        print("a concurrent run failed (across affinity groups)", file=sys.stderr)
+        return 1
+    print_run(
+        f"across groups: {args.procs} processes x {per_proc_rows} rows on dies {devices}",
+        devices,
+        nodes,
+        across,
+    )
+    across_total = sum(across)
+
+    same_total = None
+    same_devices: list[int] = []
+    if args.same_group and clusters and len(devices) >= 2:
+        # Two dies from the same affinity group share one host port, so they answer
+        # "can the port feed more than one die" independently of the socket layout.
+        group = next((c for c in clusters if devices[0] in c["devices"]), None)
+        if group is not None and len(group["devices"]) >= 2:
+            same_devices = group["devices"][: len(devices)]
+            same_nodes = [node_of_device.get(device) for device in same_devices]
+            if same_devices != devices:
+                same = measure(same_devices, same_nodes, args, per_proc_rows)
+                if same is None:
+                    print("a concurrent run failed (same affinity group)", file=sys.stderr)
+                else:
+                    print_run(
+                        f"same group: {len(same_devices)} processes x {per_proc_rows} rows "
+                        f"on dies {same_devices} (one socket)",
+                        same_devices,
+                        same_nodes,
+                        same,
+                    )
+                    same_total = sum(same)
+
+    print("summary")
+    print(f"  single die                        {single:>7.1f} GB/s")
+    print(
+        f"  {len(devices)} dies across groups        "
+        f"{across_total:>7.1f} GB/s  (x{across_total / single:.2f})"
+    )
+    if same_total is not None:
         print(
-            "verdict: the host path SCALES. A single run cannot saturate it, so more "
-            "concurrent engines (or two registered source windows inside one kernel) "
-            "can use the bandwidth that is idle today."
+            f"  {len(same_devices)} dies in one group        "
+            f"{same_total:>7.1f} GB/s  (x{same_total / single:.2f})"
         )
+    print()
+
+    if across_total >= single * 1.5:
         print(
-            "  next: if the two processes sit on two different dies, a single-die kernel "
-            "cannot follow -- the win has to come from running more dies, not from "
-            "restructuring one kernel's copy."
+            "verdict: the host path SCALES across sockets -- each socket's port is usable "
+            "on its own, so a single die is limited to roughly one port's worth."
         )
     else:
         print(
-            "verdict: the host path does NOT scale past one instance. Either it is "
-            "already saturated (single link / shared host adapter) or the extra "
-            "processes never overlapped (check --cores and that the two processes "
-            "landed on dies from different affinity groups)."
+            "verdict: two sockets do NOT add up; the two dies share one port or one "
+            "adapter, so spreading work across dies buys nothing."
         )
+
+    if same_total is not None:
+        if same_total >= single * 1.5:
+            print(
+                "  one socket's port still feeds several dies at full rate: the ceiling "
+                "you hit on a single die is the per-die DMA engine, not the port. More "
+                "dies on that socket keep scaling; one die cannot go faster."
+            )
+        else:
+            print(
+                "  one socket's port saturates at a single die's rate: the port itself is "
+                "the ceiling. Only a second socket (or a second registered window onto "
+                "that socket's DRAM, if the die can address it) adds bandwidth."
+            )
     return 0
 
 
