@@ -518,7 +518,7 @@ void npu_fused_scatter_copy_sparse_flash_attention_meta(
 
 void scatter_copy_ub_bench_meta(
     const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-    at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t)
+    at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t)
 {
 }
 

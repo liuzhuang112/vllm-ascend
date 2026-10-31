@@ -8,9 +8,22 @@ Measures only the copy stage of
 
     DRAM src --MTE2--> UB bank --MTE3--> HBM dst
 
-One token row is 1152 B of payload at bf16/fp16: CKV (512 elems) + KPE (64
-elems), split across two source/destination tensors exactly like the paged K/V
-cache layout, so the per-token cost is two DataCopyPad calls per direction.
+One token row is `--ckv-dim` elements of the CKV plane plus `--kpe-dim`
+elements of the KPE plane, split across two source/destination tensors exactly
+like the paged K/V cache layout, so the per-token cost is two DataCopyPad calls
+per direction.
+
+Defaults reproduce the bf16 MLA cache: CKV 512 + KPE 64 = 1152 B per token.
+Two other shapes matter in practice and are one flag away:
+
+    # DeepSeek-style fp8 MLA cache: one 656 B row, no separate rope plane
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 \
+        --ckv-dim 656 --kpe-dim 0 --dtype fp8
+
+    # the padded variant of the same row, for comparison: 672 B is a whole
+    # number of 32 B units, so it keeps the coalescing paths alive
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 \
+        --ckv-dim 672 --kpe-dim 0 --dtype fp8 --sweep group-rows
 
 Source placement decides what is being measured:
 
@@ -77,8 +90,12 @@ torch_npu = None
 
 CKV_DIM = 512
 KPE_DIM = 64
-ROW_BYTES_PER_ELEM = CKV_DIM + KPE_DIM  # elements copied per token
 OP_NAME = "scatter_copy_ub_bench"
+# Element size of each supported cache dtype, in bytes. fp8 has no arithmetic
+# here -- the op moves bytes -- so uint8 is accepted as the same instantiation.
+DTYPES = {"bf16": (torch.bfloat16, 2), "fp16": (torch.float16, 2), "uint8": (torch.uint8, 1)}
+if hasattr(torch, "float8_e4m3fn"):
+    DTYPES["fp8"] = (torch.float8_e4m3fn, 1)
 # ``torch.pin_memory()`` only locks pages; it does not publish the range to the
 # device. ``aclrtHostRegisterV2`` does, and the payload is then aligned to this
 # boundary -- engram/npu.py aligns to 64 KiB because unaligned device reads of a
@@ -301,6 +318,30 @@ def _host_register_flags() -> int:
         return ACL_HOST_REG_MAPPED
 
 
+def _elem_size(dtype: torch.dtype) -> int:
+    return torch.empty(0, dtype=dtype).element_size()
+
+
+def _random_values(rows: int, dim: int, dtype: torch.dtype, gen: torch.Generator) -> torch.Tensor:
+    """Random payload of the right dtype.
+
+    Only the byte pattern matters to the copy, and it must be non-degenerate so
+    the verifier can tell a torn row from a row that was never written. Both
+    1-byte dtypes are therefore filled with raw bytes and reinterpreted: fp8 has
+    no randn/compare kernel on every torch build, and a NaN-heavy payload would
+    still compare unequal if it went through float arithmetic.
+    """
+    if _elem_size(dtype) == 1:
+        raw = torch.randint(0, 256, (rows, dim), generator=gen, dtype=torch.uint8)
+        return raw.view(dtype) if dtype is not torch.uint8 else raw
+    return torch.randn(rows, dim, generator=gen).to(dtype)
+
+
+def _comparable(t: torch.Tensor) -> torch.Tensor:
+    """View 1-byte dtypes as uint8 so comparisons never touch fp8 arithmetic."""
+    return t.view(torch.uint8) if t.element_size() == 1 else t
+
+
 @dataclass
 class Case:
     rows: int
@@ -311,6 +352,21 @@ class Case:
     dtype: torch.dtype
     src: str
     device: int = 0
+    ckv_dim: int = CKV_DIM
+    kpe_dim: int = KPE_DIM
+
+    @property
+    def copy_rope(self) -> bool:
+        return self.kpe_dim > 0
+
+    @property
+    def elem_size(self) -> int:
+        return _elem_size(self.dtype)
+
+    @property
+    def row_bytes(self) -> int:
+        """Bytes actually moved per token (the KPE plane may be off)."""
+        return (self.ckv_dim + (self.kpe_dim if self.copy_rope else 0)) * self.elem_size
 
 
 class Bench:
@@ -334,10 +390,20 @@ class Bench:
         self.src_rows = torch.randperm(rows, generator=gen).to(torch.int32)
         self.dst_rows = (torch.randperm(rows * 4, generator=gen)[:rows]).to(torch.int32)
 
-        self.src_kv_dev, self.src_kv_cpu = self._make_source(rows, CKV_DIM, gen)
-        self.src_rope_dev, self.src_rope_cpu = self._make_source(rows, KPE_DIM, gen)
-        self.dst_kv = torch.zeros(rows * 4, CKV_DIM, dtype=case.dtype, device=self.device)
-        self.dst_rope = torch.zeros(rows * 4, KPE_DIM, dtype=case.dtype, device=self.device)
+        self.src_kv_dev, self.src_kv_cpu = self._make_source(rows, case.ckv_dim, gen)
+        self.dst_kv = torch.zeros(rows * 4, case.ckv_dim, dtype=case.dtype, device=self.device)
+        if case.copy_rope:
+            self.src_rope_dev, self.src_rope_cpu = self._make_source(rows, case.kpe_dim, gen)
+            self.dst_rope = torch.zeros(rows * 4, case.kpe_dim, dtype=case.dtype, device=self.device)
+        else:
+            # copy_rope=0: the rope tensors are still required by the op schema
+            # but the kernel never touches them, so a one-element placeholder on
+            # the right device is all it takes. A [rows, 0] tensor would be the
+            # semantically cleaner argument, but zero-sized inputs are rejected
+            # by some graph paths.
+            self.src_rope_dev = torch.zeros(1, 1, dtype=case.dtype, device=self.device)
+            self.src_rope_cpu = None
+            self.dst_rope = torch.zeros(1, 1, dtype=case.dtype, device=self.device)
 
         if case.table_mode == 0:
             # Identity addressing: the kernel never reads the row tables. The
@@ -350,7 +416,7 @@ class Bench:
         self.dst_rows_dev = self.dst_rows.to(self.device)
 
     def _make_source(self, rows: int, dim: int, gen: torch.Generator):
-        values = torch.randn(rows, dim, generator=gen).to(self.case.dtype)
+        values = _random_values(rows, dim, self.case.dtype, gen)
         if self.case.src == "npu":
             return values.to(self.device), None
         if self.case.src != "host":
@@ -459,6 +525,7 @@ class Bench:
             self.case.group_rows,
             self.case.table_mode,
             self.case.cores,
+            int(self.case.copy_rope),
         )
 
     def verify(self, sample: int = 64, repeats: int = 1) -> None:
@@ -469,23 +536,32 @@ class Bench:
         non-deterministic kernel: a launch that passes once and fails later
         points at a missing fence or uninitialised state, not at an addressing
         bug (that one fails every time, on the same rows).
+
+        With ``kpe_dim == 0`` the rope plane is never written, so only the CKV
+        plane is checked; the placeholder rope tensors hold no reference data.
         """
         total = self.case.rows
         sample = total if sample <= 0 else min(sample, total)
         idx = torch.arange(sample, dtype=torch.int64)
-        src_flat = self._source_cpu(self.src_kv_cpu, self.src_kv_dev)
-        rope_flat = self._source_cpu(self.src_rope_cpu, self.src_rope_dev)
+        src_flat = _comparable(self._source_cpu(self.src_kv_cpu, self.src_kv_dev))
         want_kv = src_flat[self.src_rows[idx].to(torch.int64)]
-        want_rope = rope_flat[self.src_rows[idx].to(torch.int64)]
         dst_idx = self.dst_rows[idx].to(torch.int64)
+        check_rope = self.case.copy_rope
+        if check_rope:
+            rope_flat = _comparable(self._source_cpu(self.src_rope_cpu, self.src_rope_dev))
+            want_rope = rope_flat[self.src_rows[idx].to(torch.int64)]
 
         for attempt in range(repeats):
             self.run()
             torch.npu.synchronize()
-            got_kv = self.dst_kv[dst_idx].cpu()
-            got_rope = self.dst_rope[dst_idx].cpu()
+            got_kv = _comparable(self.dst_kv[dst_idx].cpu())
             bad_kv = (got_kv != want_kv).any(dim=1)
-            bad_rope = (got_rope != want_rope).any(dim=1)
+            if check_rope:
+                got_rope = _comparable(self.dst_rope[dst_idx].cpu())
+                bad_rope = (got_rope != want_rope).any(dim=1)
+            else:
+                got_rope = want_rope = None
+                bad_rope = torch.zeros_like(bad_kv)
             if bool(bad_kv.any()) or bool(bad_rope.any()):
                 summary = self._report_mismatch(
                     attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope, src_flat
@@ -495,6 +571,7 @@ class Bench:
                 )
             print(
                 f"verify: attempt {attempt + 1}/{repeats} ok ({sample}/{total} rows, "
+                f"{self.case.ckv_dim}+{self.case.kpe_dim} elems x{self.case.elem_size}B, "
                 f"{self.case.bank} banks, group {self.case.group_rows}, table_mode {self.case.table_mode})",
                 flush=True,
             )
@@ -508,7 +585,7 @@ class Bench:
         """
         rows = torch.nonzero(bad_kv | bad_rope).flatten().tolist()
         total_kv = int((got_kv != want_kv).sum())
-        total_rope = int((got_rope != want_rope).sum())
+        total_rope = int((got_rope != want_rope).sum()) if got_rope is not None else 0
         print(
             f"\nverify: attempt {attempt + 1}/{repeats} mismatched {len(rows)}/{got_kv.shape[0]} sampled rows "
             f"(kv {total_kv} elems, rope {total_rope} elems; first rows {rows[:8]})",
@@ -530,17 +607,20 @@ class Bench:
             elif bool((got == 0).all()):
                 hint = "all zeros -> row never written"
             span = f"[{int(cols[0])}..{int(cols[-1])}]" if cols.numel() else "none"
-            rope_bad = bool((got_rope[r] != want_rope[r]).any())
+            if got_rope is None:
+                rope_state = "n/a (copy_rope=0)"
+            else:
+                rope_state = "bad" if bool((got_rope[r] != want_rope[r]).any()) else "ok"
             print(
                 f"  sample row {r}: dst_tok={dst_tok} src_tok={src_tok}, "
                 f"kv bad {cols.numel()}/{want.numel()} cols {span}, "
-                f"rope {'bad' if rope_bad else 'ok'} | {hint}",
+                f"rope {rope_state} | {hint}",
                 flush=True,
             )
             if not first:
                 first = (
                     f"sample row {r} dst_tok={dst_tok} src_tok={src_tok}, kv bad "
-                    f"{cols.numel()}/{want.numel()} cols {span}, rope {'bad' if rope_bad else 'ok'}, {hint}"
+                    f"{cols.numel()}/{want.numel()} cols {span}, rope {rope_state}, {hint}"
                 )
         return f"{len(rows)}/{got_kv.shape[0]} sampled rows bad; {first}"
 
@@ -548,7 +628,7 @@ class Bench:
         return host if host is not None else view.cpu()
 
     def bytes(self) -> int:
-        return self.case.rows * ROW_BYTES_PER_ELEM * self.dst_kv.element_size()
+        return self.case.rows * self.case.row_bytes
 
 
 def time_case(
@@ -575,6 +655,22 @@ def time_case(
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rows", type=int, default=2048, help="token rows to copy per launch")
+    parser.add_argument(
+        "--ckv-dim",
+        type=int,
+        default=CKV_DIM,
+        help=f"elements per row in the CKV plane (default {CKV_DIM}); multiplied by the "
+        "dtype size to get the row bytes, e.g. 656 fp8 bytes for the DeepSeek-style "
+        "MLA cache",
+    )
+    parser.add_argument(
+        "--kpe-dim",
+        type=int,
+        default=KPE_DIM,
+        help=f"elements per row in the KPE plane (default {KPE_DIM}); 0 disables the plane "
+        "entirely (copy_rope=0), which is the fp8 layout where the rope part is part of "
+        "the 656 B row",
+    )
     parser.add_argument("--bank", type=int, default=2, help="UB pipeline depth (1 disables overlap)")
     parser.add_argument("--group-rows", type=int, default=1, help="rows merged into one DataCopyPad")
     parser.add_argument("--table-mode", type=int, default=1, help="1 = gather/scatter via row tables, 0 = identity")
@@ -593,7 +689,13 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="with --src host, restart under numactl --interleave=all so the source pages "
         "span every NUMA node (one host link per node: this is what uses both UB ports)",
     )
-    parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument(
+        "--dtype",
+        choices=tuple(DTYPES),
+        default="bf16",
+        help="cache element type; fp8 and uint8 are copied byte-wide, so they measure the "
+        "same DMA path (uint8 is the escape hatch when no fp8 tensor factory is available)",
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument(
         "--json",
@@ -643,7 +745,9 @@ def main(argv=None) -> int:
             print("note: --host-interleave only affects --src host", file=sys.stderr)
         _reexec_interleaved(sys.argv[1:])
     _load_runtime()
-    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    dtype = DTYPES[args.dtype][0]
+    if args.kpe_dim < 0 or args.ckv_dim <= 0:
+        raise SystemExit("--ckv-dim must be > 0 and --kpe-dim must be >= 0")
 
     base = Case(
         rows=args.rows,
@@ -654,6 +758,17 @@ def main(argv=None) -> int:
         dtype=dtype,
         src=args.src,
         device=args.device,
+        ckv_dim=args.ckv_dim,
+        kpe_dim=args.kpe_dim,
+    )
+    row_bytes = base.row_bytes
+    print(
+        f"row: {base.ckv_dim} elems CKV"
+        + (f" + {base.kpe_dim} elems KPE" if base.copy_rope else " (KPE plane off)")
+        + f", {args.dtype}, {row_bytes} B/token"
+        + ("" if row_bytes % 32 == 0 else ", not a multiple of 32 B -> per-row DMA only"),
+        file=sys.stderr,
+        flush=True,
     )
 
     points: list[tuple[str, Case]] = []
@@ -664,7 +779,7 @@ def main(argv=None) -> int:
             case = Case(**{**base.__dict__, args.sweep.replace("-", "_"): value})
             points.append((f"{args.sweep}={value}", case))
 
-    header = f"{'case':>18} {'rows':>7} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
+    header = f"{'case':>18} {'rows':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
     header += f"{'us':>9} {'GB/s':>8}"
     print(header)
     print("-" * len(header))
@@ -685,6 +800,10 @@ def main(argv=None) -> int:
                             "src": case.src,
                             "device": case.device,
                             "rows": case.rows,
+                            "row_bytes": case.row_bytes,
+                            "dtype": args.dtype,
+                            "ckv_dim": case.ckv_dim,
+                            "kpe_dim": case.kpe_dim,
                             "group_rows": case.group_rows,
                             "bank": case.bank,
                             "table_mode": case.table_mode,
@@ -698,8 +817,9 @@ def main(argv=None) -> int:
                 )
             else:
                 print(
-                    f"{label:>18} {case.rows:>7} {case.group_rows:>5} {case.bank:>4} "
-                    f"{case.table_mode:>3} {case.cores:>5} {us_min:>9.1f} {gbps:>8.1f}"
+                    f"{label:>18} {case.rows:>7} {case.row_bytes:>6} {case.group_rows:>5} "
+                    f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
+                    f"{us_min:>9.1f} {gbps:>8.1f}"
                 )
                 if us_med != us_min:
                     print(f"{'':>18} median {us_med:.1f} us")

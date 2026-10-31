@@ -22,13 +22,18 @@
  * in this repo use TQueBind for the same reason: moe/scatter_nd_update_sk and
  * the production first_fill_scatter_copy kernel.
  *
+ * Row layout. Two planes are copied per token, exactly like the paged K/V cache
+ * the production op walks: a CKV plane (ckv_dim elements) and a KPE plane
+ * (kpe_dim elements). Either plane may be byte-sized (fp8 / uint8), and the KPE
+ * plane may be switched off entirely (copy_rope = 0), which is what the
+ * DeepSeek-style fp8 MLA cache needs: one 656 B row, no separate rope plane.
+ *
  * Differences from the production kernel (all of them are knobs here):
  *   - bank_num / group_rows / core_num are runtime parameters instead of
  *     compile-time constants, so one binary can sweep the whole space;
  *   - group_rows > 1 coalesces up to SCB_MAX_GROUP_ROWS rows whenever their
- *     source rows are contiguous and their destination rows advance with a
- *     constant stride, the same trick the production kernel uses for adjacent
- *     miss pairs;
+ *     source rows are contiguous; the write side picks between one contiguous
+ *     descriptor and one strided descriptor (see GroupMode);
  *   - table_mode == 0 skips the scalar GM reads of the row tables to expose the
  *     pure transfer ceiling, table_mode == 1 keeps the production-style
  *     `GlobalTensor::GetValue` address generation.
@@ -45,6 +50,23 @@ constexpr int64_t SCB_ALIGN_BYTES = 32;
 // Upper bounds of the runtime knobs; the tiling layer clamps to these.
 constexpr uint32_t SCB_MAX_BANKS = 8;
 constexpr uint32_t SCB_MAX_GROUP_ROWS = 8;
+
+/**
+ * How one group's rows are laid out in UB and moved by DMA.
+ *
+ * The distinction only matters when a row is not a multiple of 32 B: an fp8 row
+ * of 656 B cannot be placed at `r * 656` in UB, because DataCopyPad requires a
+ * 32 B aligned LocalTensor. GROUP_MODE_ROWS therefore pads every row to the next
+ * 32 B (656 -> 672) and copies row by row, while the two coalesced modes keep
+ * the rows tight and never address one row individually, so they work for any
+ * row length -- but they can only be used when the rows really are consecutive
+ * on both sides.
+ */
+enum GroupMode : int64_t {
+    GROUP_MODE_ROWS = 0,        // one descriptor per row, UB rows padded to 32 B
+    GROUP_MODE_CONTIGUOUS = 1,  // whole group is one tight copy in and out
+    GROUP_MODE_STRIDED = 2,     // tight read, strided write (dst step > 1)
+};
 
 template <typename T, uint32_t BANK_COUNT>
 class ScatterCopyUbBenchKernel {
@@ -65,17 +87,22 @@ public:
         pipe_ = pipe;
         numTokens_ = tiling.numTokens;
         ckvDim_ = tiling.ckvDim;
-        kpeDim_ = tiling.kpeDim;
+        copyRope_ = (tiling.copyRope != 0) && (tiling.kpeDim > 0);
+        kpeDim_ = copyRope_ ? tiling.kpeDim : 0;
         groupRows_ = tiling.groupRows;
         bankNum_ = static_cast<uint32_t>(tiling.bankNum);
         usedCoreNum_ = static_cast<uint32_t>(tiling.usedCoreNum);
         tableMode_ = tiling.tableMode;
 
-        // One slot holds `group_rows` CKV rows followed by the same number of
-        // KPE rows, mirroring the two separate source tensors. The KPE plane
-        // starts 32B aligned so both planes stay DMA friendly.
-        kpeOffsetElems_ = AlignBytesToElems(groupRows_ * ckvDim_ * static_cast<int64_t>(sizeof(T)));
-        const int64_t slotElems = kpeOffsetElems_ + groupRows_ * kpeDim_;
+        // UB row stride, not the row length: a 656 B fp8 row occupies 672 B so
+        // that the next row still starts on a 32 B boundary. For every row that
+        // is already a multiple of 32 B (bf16/fp16 caches) this is a no-op.
+        ubRowElems_ = AlignBytesToElems(ckvDim_ * static_cast<int64_t>(sizeof(T)));
+        kpeUbRowElems_ = copyRope_ ? AlignBytesToElems(kpeDim_ * static_cast<int64_t>(sizeof(T))) : 0;
+        // The KPE plane starts on the 32 B boundary after `groupRows_` CKV slots,
+        // so both planes stay DMA friendly in every mode.
+        kpeOffsetElems_ = ubRowElems_ * groupRows_;
+        const int64_t slotElems = kpeOffsetElems_ + kpeUbRowElems_ * groupRows_;
         pipe_->InitBuffer(copyQueue_, static_cast<uint8_t>(bankNum_),
                           static_cast<uint32_t>(slotElems * sizeof(T)));
     }
@@ -132,7 +159,7 @@ private:
 
         // Resolve this group. The read side only needs to know whether the run
         // is contiguous; the write side keeps every destination row because a
-        // random scatter cannot be described by one descriptor.
+        // random scatter cannot be described by one strided descriptor.
         int64_t srcTok[SCB_MAX_GROUP_ROWS];
         for (int64_t r = 0; r < count; ++r) {
             const int64_t tokenIdx = rowStart + r;
@@ -159,8 +186,19 @@ private:
                 dstStrided = false;
             }
         }
-        coalescedIn_[slot] = srcContiguous;
-        coalescedOut_[slot] = dstStrided;
+
+        // A 32 B multiple per row is what lets the tight UB rows be described by
+        // one strided descriptor; it is not needed by the fully contiguous mode,
+        // which never addresses a single row.
+        int64_t mode = GROUP_MODE_ROWS;
+        if (srcContiguous && dstStrided) {
+            if (dstStep == 1) {
+                mode = GROUP_MODE_CONTIGUOUS;
+            } else if (rowAlignable()) {
+                mode = GROUP_MODE_STRIDED;
+            }
+        }
+        mode_[slot] = mode;
 
         // The queue type depends on the class template parameter BANK_COUNT, so
         // the member template has to be disambiguated with `template`.
@@ -184,24 +222,30 @@ private:
         params.srcStride = 0;
         params.dstStride = 0;
 
-        if (srcContiguous) {
+        if (mode != GROUP_MODE_ROWS) {
             // The whole group is one contiguous source run, so MTE2 issues one
-            // descriptor whose length spans every row.
+            // descriptor whose length spans every row -- and the rows land in
+            // UB back to back, which is what the two coalesced copy-out modes
+            // expect.
             params.blockLen = static_cast<uint32_t>(count * ckvDim_ * sizeof(T));
             DataCopyPad(local, srcKvGm_[srcTok[0] * ckvDim_], params, padParams);
 
-            params.blockLen = static_cast<uint32_t>(count * kpeDim_ * sizeof(T));
-            DataCopyPad(local[kpeOffsetElems_], srcRopeGm_[srcTok[0] * kpeDim_], params, padParams);
+            if (copyRope_) {
+                params.blockLen = static_cast<uint32_t>(count * kpeDim_ * sizeof(T));
+                DataCopyPad(local[kpeOffsetElems_], srcRopeGm_[srcTok[0] * kpeDim_], params, padParams);
+            }
         } else {
             for (int64_t r = 0; r < count; ++r) {
                 params.blockCount = 1;
                 params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
                 params.srcStride = 0;
-                DataCopyPad(local[r * ckvDim_], srcKvGm_[srcTok[r] * ckvDim_], params, padParams);
+                DataCopyPad(local[r * ubRowElems_], srcKvGm_[srcTok[r] * ckvDim_], params, padParams);
 
-                params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
-                DataCopyPad(local[kpeOffsetElems_ + r * kpeDim_], srcRopeGm_[srcTok[r] * kpeDim_], params,
-                            padParams);
+                if (copyRope_) {
+                    params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
+                    DataCopyPad(local[kpeOffsetElems_ + r * kpeUbRowElems_], srcRopeGm_[srcTok[r] * kpeDim_],
+                                params, padParams);
+                }
             }
         }
         copyQueue_.EnQue(local);
@@ -216,26 +260,44 @@ private:
         params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
         params.srcStride = 0;
         params.dstStride = 0;
+        const int64_t count = count_[slot];
 
-        if (coalescedOut_[slot]) {
+        if (mode_[slot] == GROUP_MODE_CONTIGUOUS) {
+            // src and dst rows advance by one on both sides: the whole group is
+            // a single tight transfer in each direction.
+            params.blockLen = static_cast<uint32_t>(count * ckvDim_ * sizeof(T));
+            DataCopyPad(dstKvGm_[dstTok_[slot][0] * ckvDim_], local, params);
+
+            if (copyRope_) {
+                params.blockLen = static_cast<uint32_t>(count * kpeDim_ * sizeof(T));
+                DataCopyPad(dstRopeGm_[dstTok_[slot][0] * kpeDim_], local[kpeOffsetElems_], params);
+            }
+        } else if (mode_[slot] == GROUP_MODE_STRIDED) {
             const int64_t dstStep = dstTok_[slot][1] - dstTok_[slot][0];
-            params.blockCount = static_cast<uint16_t>(count_[slot]);
+            params.blockCount = static_cast<uint16_t>(count);
+            params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
+            // Zero gap in UB (the rows were read tight), constant gap in GM.
+            params.srcStride = 0;
             params.dstStride = static_cast<uint32_t>((dstStep - 1) * ckvDim_ * sizeof(T));
             DataCopyPad(dstKvGm_[dstTok_[slot][0] * ckvDim_], local, params);
 
-            params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
-            params.dstStride = static_cast<uint32_t>((dstStep - 1) * kpeDim_ * sizeof(T));
-            DataCopyPad(dstRopeGm_[dstTok_[slot][0] * kpeDim_], local[kpeOffsetElems_], params);
+            if (copyRope_) {
+                params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
+                params.dstStride = static_cast<uint32_t>((dstStep - 1) * kpeDim_ * sizeof(T));
+                DataCopyPad(dstRopeGm_[dstTok_[slot][0] * kpeDim_], local[kpeOffsetElems_], params);
+            }
         } else {
-            for (int64_t r = 0; r < count_[slot]; ++r) {
+            for (int64_t r = 0; r < count; ++r) {
                 params.blockCount = 1;
                 params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
                 params.dstStride = 0;
-                DataCopyPad(dstKvGm_[dstTok_[slot][r] * ckvDim_], local[r * ckvDim_], params);
+                DataCopyPad(dstKvGm_[dstTok_[slot][r] * ckvDim_], local[r * ubRowElems_], params);
 
-                params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
-                DataCopyPad(dstRopeGm_[dstTok_[slot][r] * kpeDim_],
-                            local[kpeOffsetElems_ + r * kpeDim_], params);
+                if (copyRope_) {
+                    params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
+                    DataCopyPad(dstRopeGm_[dstTok_[slot][r] * kpeDim_], local[kpeOffsetElems_ + r * kpeUbRowElems_],
+                                params);
+                }
             }
         }
         // FreeTensor returns the bank to MTE2 only after the TQueBind has
@@ -244,6 +306,20 @@ private:
         // hand-fetched event id can collide with the one the queue reserves
         // for the same HardEvent.
         copyQueue_.FreeTensor(local);
+    }
+
+    // Both planes must consist of whole 32 B units for the strided copy-out:
+    // only then are the tight UB rows still 32 B apart in the descriptor sense.
+    __aicore__ inline bool rowAlignable() const
+    {
+        const int64_t ckvBytes = ckvDim_ * static_cast<int64_t>(sizeof(T));
+        if ((ckvBytes % SCB_ALIGN_BYTES) != 0) {
+            return false;
+        }
+        if (copyRope_ && ((kpeDim_ * static_cast<int64_t>(sizeof(T))) % SCB_ALIGN_BYTES) != 0) {
+            return false;
+        }
+        return true;
     }
 
 private:
@@ -272,17 +348,19 @@ private:
     int64_t groupRows_ = 1;
     int64_t totalGroups_ = 0;
     int64_t groups_ = 0;
+    int64_t ubRowElems_ = 0;
+    int64_t kpeUbRowElems_ = 0;
     int64_t kpeOffsetElems_ = 0;
     int64_t tableMode_ = 0;
+    bool copyRope_ = false;
     uint32_t bankNum_ = 2;
     uint32_t usedCoreNum_ = 1;
 
-    // Destination rows of each in-flight group, plus the two coalescing
-    // decisions. This is the only scalar state the pipeline carries.
+    // Destination rows of each in-flight group, the layout decision, and the
+    // row count. This is the only scalar state the pipeline carries.
     int64_t dstTok_[SCB_MAX_BANKS][SCB_MAX_GROUP_ROWS];
     int64_t count_[SCB_MAX_BANKS];
-    bool coalescedIn_[SCB_MAX_BANKS];
-    bool coalescedOut_[SCB_MAX_BANKS];
+    int64_t mode_[SCB_MAX_BANKS];
 };
 }  // namespace
 
@@ -299,10 +377,16 @@ extern "C" __global__ __aicore__ void scatter_copy_ub_bench(GM_ADDR srcKv, GM_AD
     GET_TILING_DATA_WITH_STRUCT(ScatterCopyUbBenchTilingData, tilingData, tiling);
 
     TPipe pipe;
-    // Both instantiations are compiled here on purpose: the element type is a
-    // runtime field, so the op needs no tiling-key registration.
+    // Every instantiation is compiled here on purpose: the element type is a
+    // runtime field, so the op needs no tiling-key registration. fp8 has no
+    // arithmetic here -- the copy is byte-wide, so it rides the uint8_t
+    // instantiation.
     if (tilingData.dataType == 2) {
         ScatterCopyUbBenchKernel<half, SCB_MAX_BANKS> op;
+        op.Init(srcKv, srcRope, srcRows, dstRows, dstKv, dstRope, tilingData, &pipe);
+        op.Process();
+    } else if (tilingData.dataType == 3) {
+        ScatterCopyUbBenchKernel<uint8_t, SCB_MAX_BANKS> op;
         op.Init(srcKv, srcRope, srcRows, dstRows, dstKv, dstRope, tilingData, &pipe);
         op.Process();
     } else {

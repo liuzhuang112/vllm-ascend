@@ -24,7 +24,8 @@ struct ScatterCopyUbBenchTilingData {
     int64_t bankNum;     // UB slots of the TQueBind pipeline
     int64_t usedCoreNum; // AIV blocks to launch
     int64_t tableMode;   // 0 = identity rows, 1 = read the row tables
-    int64_t dataType;    // 1 = bf16, 2 = fp16
+    int64_t dataType;    // 1 = bf16, 2 = fp16, 3 = fp8/uint8 (byte-wide copy)
+    int64_t copyRope;    // 0 = no KPE plane at all (kpeDim is forced to 0)
 };
 
 #endif

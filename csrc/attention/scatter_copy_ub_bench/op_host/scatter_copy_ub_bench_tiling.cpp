@@ -28,6 +28,14 @@ constexpr size_t ATTR_BANK_NUM = 0;
 constexpr size_t ATTR_GROUP_ROWS = 1;
 constexpr size_t ATTR_TABLE_MODE = 2;
 constexpr size_t ATTR_CORE_NUM = 3;
+constexpr size_t ATTR_COPY_ROPE = 4;
+
+constexpr int64_t UB_ALIGN_BYTES = 32;
+
+int64_t AlignUp(int64_t value, int64_t alignment)
+{
+    return (value + alignment - 1) / alignment * alignment;
+}
 
 int64_t CeilDiv(int64_t value, int64_t divisor)
 {
@@ -55,7 +63,9 @@ ge::graphStatus Tiling4ScatterCopyUbBench(gert::TilingContext *context)
     const int64_t *groupRowsPtr = attrs->GetAttrPointer<int64_t>(ATTR_GROUP_ROWS);
     const int64_t *tableModePtr = attrs->GetAttrPointer<int64_t>(ATTR_TABLE_MODE);
     const int64_t *coreNumPtr = attrs->GetAttrPointer<int64_t>(ATTR_CORE_NUM);
-    if (bankNumPtr == nullptr || groupRowsPtr == nullptr || tableModePtr == nullptr || coreNumPtr == nullptr) {
+    const int64_t *copyRopePtr = attrs->GetAttrPointer<int64_t>(ATTR_COPY_ROPE);
+    if (bankNumPtr == nullptr || groupRowsPtr == nullptr || tableModePtr == nullptr || coreNumPtr == nullptr ||
+        copyRopePtr == nullptr) {
         return ge::GRAPH_FAILED;
     }
 
@@ -66,20 +76,45 @@ ge::graphStatus Tiling4ScatterCopyUbBench(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
 
+    // The element type is a plain field instead of a tiling key: the kernel
+    // then instantiates every branch unconditionally, which keeps the op free
+    // of any tiling-key registration in the build.
+    const auto dataTypeValue = srcKvDesc->GetDataType();
+    int64_t dataType = 0;
+    int64_t elemBytes = 2;
+    if (dataTypeValue == ge::DT_BF16) {
+        dataType = 1;
+        elemBytes = 2;
+    } else if (dataTypeValue == ge::DT_FLOAT16) {
+        dataType = 2;
+        elemBytes = 2;
+    } else if (dataTypeValue == ge::DT_FLOAT8_E4M3FN || dataTypeValue == ge::DT_UINT8) {
+        // An fp8 cache is copied byte for byte; there is no arithmetic involved,
+        // so the kernel rides its uint8_t instantiation.
+        dataType = 3;
+        elemBytes = 1;
+    } else {
+        return ge::GRAPH_FAILED;
+    }
+
+    const bool copyRope = (*copyRopePtr != 0);
     const int64_t numTokens = srcRowsShape.GetDim(0);
     const int64_t ckvDim = srcKvShape.GetDim(1);
-    const int64_t kpeDim = srcRopeShape.GetDim(1);
+    const int64_t kpeDim = copyRope ? srcRopeShape.GetDim(1) : 0;
     int64_t groupRows = Clamp(*groupRowsPtr, 1, MAX_GROUP_ROWS);
     int64_t bankNum = Clamp(*bankNumPtr, 1, MAX_BANKS);
     const int64_t tableMode = (*tableModePtr != 0) ? 1 : 0;
 
-    // Both supported element types are 16 bit. Keep the whole pipeline inside
-    // the vector buffer; when the user asks for too many banks, drop banks
-    // rather than fail, and report the reduction through the profile.
-    constexpr int64_t ELEM_BYTES = 2;
+    // One slot holds groupRows CKV rows plus the same number of KPE rows. Each
+    // plane is measured in 32 B aligned rows, exactly like the kernel's UB row
+    // stride: an fp8 row of 656 B occupies 672 B in UB, and the tiling has to
+    // budget for that or the kernel's InitBuffer would overrun the queue.
+    const int64_t ubRowBytes = AlignUp(ckvDim * elemBytes, UB_ALIGN_BYTES);
+    const int64_t kpeRowBytes = copyRope ? AlignUp(kpeDim * elemBytes, UB_ALIGN_BYTES) : 0;
     constexpr int64_t UB_BUDGET_BYTES = 160 * 1024;
-    int64_t slotBytes = groupRows * (ckvDim + kpeDim) * ELEM_BYTES;
-    slotBytes = (slotBytes + 31) / 32 * 32 + 32;  // plane alignment slack
+    int64_t slotBytes = groupRows * (ubRowBytes + kpeRowBytes);
+    // Keep the whole pipeline inside the vector buffer; when the user asks for
+    // too many banks, drop banks rather than fail.
     while (bankNum > 1 && bankNum * slotBytes > UB_BUDGET_BYTES) {
         --bankNum;
     }
@@ -102,18 +137,6 @@ ge::graphStatus Tiling4ScatterCopyUbBench(gert::TilingContext *context)
     }
     workspace[0] = ascendcPlatform.GetLibApiWorkSpaceSize();
 
-    // The element type is a plain field instead of a tiling key: the kernel
-    // then instantiates both branches unconditionally, which keeps the op free
-    // of any tiling-key registration in the build.
-    int64_t dataType = 0;
-    if (srcKvDesc->GetDataType() == ge::DT_BF16) {
-        dataType = 1;
-    } else if (srcKvDesc->GetDataType() == ge::DT_FLOAT16) {
-        dataType = 2;
-    } else {
-        return ge::GRAPH_FAILED;
-    }
-
     auto rawTiling = context->GetRawTilingData();
     if (rawTiling == nullptr || rawTiling->GetCapacity() < sizeof(ScatterCopyUbBenchTilingData)) {
         return ge::GRAPH_FAILED;
@@ -130,6 +153,7 @@ ge::graphStatus Tiling4ScatterCopyUbBench(gert::TilingContext *context)
     tiling->usedCoreNum = blockDim;
     tiling->tableMode = tableMode;
     tiling->dataType = dataType;
+    tiling->copyRope = copyRope ? 1 : 0;
     rawTiling->SetDataSize(sizeof(ScatterCopyUbBenchTilingData));
     return ge::GRAPH_SUCCESS;
 }

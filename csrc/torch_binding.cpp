@@ -3581,7 +3581,8 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "scatter_copy_ub_bench(Tensor src_kv, Tensor src_rope, "
         "Tensor src_rows, Tensor dst_rows, "
         "Tensor(a!) dst_kv, Tensor(b!) dst_rope, "
-        "int bank_num, int group_rows, int table_mode, int core_num=0) -> ()"
+        "int bank_num, int group_rows, int table_mode, int core_num=0, "
+        "int copy_rope=1) -> ()"
     );
     ops.impl("scatter_copy_ub_bench", torch::kPrivateUse1,
              &vllm_ascend::scatter_copy_ub_bench);

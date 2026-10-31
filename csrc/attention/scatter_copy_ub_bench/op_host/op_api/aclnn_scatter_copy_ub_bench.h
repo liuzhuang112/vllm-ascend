@@ -20,6 +20,7 @@ aclnnStatus aclnnScatterCopyUbBenchGetWorkspaceSize(
     const aclTensor *srcKv, const aclTensor *srcRope,
     const aclTensor *srcRows, const aclTensor *dstRows,
     int64_t bankNum, int64_t groupRows, int64_t tableMode, int64_t coreNum,
+    int64_t copyRope,
     const aclTensor *dstKv, const aclTensor *dstRope,
     uint64_t *workspaceSize, aclOpExecutor **executor);
 

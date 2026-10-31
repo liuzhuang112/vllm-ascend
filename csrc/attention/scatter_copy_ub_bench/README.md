@@ -9,9 +9,9 @@
 | 生产代码 | 本 demo |
 |:---|:---|
 | `op_kernel/first_fill_scatter_copy_kernel.h` 的 `CopyIn` / `CopyOut` | `op_kernel/scatter_copy_ub_bench.cpp` 的同名函数 |
-| `TQueBind<VECIN, VECOUT, 2>` + `CopyIn(next) / CopyOut(cur)` 两槽软件流水 | `TQue<VECIN>` 深度由 `bank_num` 指定，`bank_num - 1` 级预取；A5 无 `TQueBind`，写法对齐 `fused_quant_scatter_copy_sparse_flash_attention` 的 `UnionCopy()` |
+| `TQueBind<VECIN, VECOUT, 2>` + `CopyIn(next) / CopyOut(cur)` 两槽软件流水 | `TQueBind<VECIN, VECOUT, BANK_COUNT>`，深度由 `bank_num` 指定，`bank_num - 1` 级预取 |
 | `srcTokenId → dram_block_table → (physicalBlock*128 + offset)` | `src_rows` / `dst_rows` 两张行表（`table_mode=1`） |
-| 每个 token 两次 `DataCopyPad`：CKV 1024B + KPE 128B | 不变（`group_rows=1` 时完全一致） |
+| 每个 token 两次 `DataCopyPad`：CKV 1024B + KPE 128B | 不变（`group_rows=1` 时完全一致）；可用 `--ckv-dim / --kpe-dim / --dtype` 改成 fp8 的 656B 单平面 |
 | `usedCoreNum * 2` 个 AIV 按 `blockIdx + k*usedCoreNum` 取任务 | `cores` 个 AIV 按 group 步进取任务 |
 
 数据通路（与生产完全一致）：
@@ -159,10 +159,12 @@ PY
 
 ### ascend950 / A5
 
-A5 没有 Vector 参与的纯拷贝用的是 `TQue<QuePosition::VECIN>` + 显式 fence，而不是
-`TQueBind`；本算子已按这个写法实现，所以 910B/A3/A5 共用同一份 kernel 源码（不需要
-`_apt.cpp` 和 `opFile.value`，`fused_quant_scatter_copy_sparse_flash_attention` 这个
-950 专用算子也是单 `.cpp`）：
+A5 上没有 Vector 参与，所以队列用 `TQueBind<QuePosition::VECIN, QuePosition::VECOUT, N>`：
+`FreeTensor` 释放 buffer 时走的是 MTE3_MTE2 这条边，正好是这条流水线需要的同步。**不要**
+再手写 `SetFlag/WaitFlag<MTE3_MTE2>`——手取的 event id 会和队列为同一个 HardEvent 预留的
+那个撞车，表现为「第一次过、第二次错」的偶发失败（排查过程见「校验」一节）。910B/A3/A5
+共用同一份 kernel 源码（不需要 `_apt.cpp` 和 `opFile.value`，`fused_quant_scatter_copy_sparse_flash_attention`
+这个 950 专用算子也是单 `.cpp`）：
 
 ```bash
 # 全量 950（会生成 csrc/build/autogen/inner/aic-ascend950-ops-info.ini）
@@ -175,10 +177,8 @@ SOC_VERSION=ascend950 VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
 
 两个 A5 上需要注意的语义差异：
 
-- `CopyOut` 末尾有 `SetFlag/WaitFlag<MTE3_MTE2>` 再 `FreeTensor`，即每个 bank 的写回
-  完成后才释放。生产代码的 source-gather 路径也是这么做的。因此 `bank_num` 在 A5 上
-  主要影响 **MTE2 预取深度**，MTE3 是逐 bank 串行排空的；要测极致写侧流水请改用
-  `UnionCopy()` 那种「每 slot 一对 `AllocEventID`」的写法。
+- `bank_num` 同时决定 MTE2 预取深度和 MTE3 的排空并行度：`FreeTensor` 等到写回完成才把
+  bank 还给 MTE2，所以 `--bank 1` 是完全串行的基线，`--bank 2` 起才有「边写边读」。
 - tiling 用 `GetCoreNumAiv()` 定核，`KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY)`
   让 A5 不配 AIC，所以 `--cores` 就是真实 AIV 数，不像生产的 MIX kernel 还要乘 2。
 
@@ -200,17 +200,20 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --sweep table-mode
 # 脚本会自己把 pinned_mem_register:True 加进 PYTORCH_NPU_ALLOC_CONF；
 # 若 torch_npu 已被提前 import，则先手动 export 该变量再运行。
 python benchmarks/kernel/scatter_copy_ub_bench.py --src host --verify
+
+# fp8 单平面行：每 token 656 B，没有 KPE 平面
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --verify
 ```
 
 输出示例：
 
 ```text
-              case    rows group bank tbl cores        us     GB/s
-------------------------------------------------------------------
-          baseline    2048     1    2   1     0      41.2     57.2
+              case    rows  B/row group bank tbl cores        us     GB/s
+-----------------------------------------------------------------------
+          baseline    2048   1152     1    2   1     0      41.2     57.2
 ```
 
-`GB/s = rows × 1152B / 时延`，即只统计有效载荷（读 1152B + 写 1152B 的实际带宽约为此值的 2 倍）。
+`GB/s = rows × B/row / 时延`，即只统计有效载荷（读一份 + 写一份的实际带宽约为此值的 2 倍）。
 
 ## 校验（`--verify`）
 
@@ -244,6 +247,9 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | 参数 | 作用 | 建议扫描范围 |
 |:---|:---|:---|
 | `--rows` | 单次 launch 搬运的 token 行数 | 512 / 2048 / 8192 / 32768 |
+| `--ckv-dim` | CKV 平面每行元素数（默认 512）；乘 dtype 字节数就是行字节数，DeepSeek 系 fp8 MLA 用 656 | 512 / 656 / 672 |
+| `--kpe-dim` | KPE 平面每行元素数（默认 64）；`0` = 不搬 KPE（`copy_rope=0`） | 64 / 0 |
+| `--dtype` | `bf16` / `fp16` / `fp8`（`float8_e4m3fn`）/ `uint8`；后两者都是逐字节搬，走同一条 DMA 路径 | bf16 / fp8 |
 | `--bank` | UB 流水槽数，`1` = 完全不重叠 | 1 / 2 / 3 / 4 / 6 / 8 |
 | `--group-rows` | 多少行合并成一次 `DataCopyPad`（源行连续时）；实测 4 行是效率平台（`--src host` 下 42.0 → 45.6 GB/s），8 行无收益 | 1 / 2 / 4 |
 | `--table-mode` | `1` = 走行表 `GetValue`（同生产）；`0` = 恒等寻址 | 0 / 1 |
@@ -258,6 +264,79 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 `--table-mode 0` 与 `--table-mode 1` 的差值，就是**每行两次 `GlobalTensor::GetValue`
 标量读**的代价。生产 kernel 里这部分开销与 DMA 是串行的，通常就是 ScatterCopy 时延里
 最容易被忽略的一块。
+
+## fp8 单平面行：CKV_DIM=656、KPE_DIM=0
+
+DeepSeek 系的 fp8 MLA 缓存把 rope 也塞进了同一行：**656 B = 512B nope(fp8) + 16B scale(fp32×4)
++ 128B rope(bf16)**。这时没有独立的 KPE 平面，每 token 只有**一次** `DataCopyPad`。
+
+```bash
+python benchmarks/kernel/scatter_copy_ub_bench.py \
+    --ckv-dim 656 --kpe-dim 0 --dtype fp8 --rows 2048 --verify
+
+# 扫流水深度 / 合并行 / 行表开销
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --sweep bank
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --sweep group-rows
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --sweep table-mode
+```
+
+`--dtype uint8` 与 `--dtype fp8` 是**同一条 DMA 路径**（kernel 里 fp8 走 `uint8_t` 实例化，
+拷贝没有算术），差别只在 Python 侧怎么造数据；fp8 张量工厂不可用时用 `uint8` 即可。
+
+### 这条路径和 bf16 版本的三个差别
+
+| 项 | bf16 1152B（512+64） | fp8 656B（单平面） |
+|:---|:---|:---|
+| 每 token 的 DMA 次数 | 2（CKV + KPE） | 1 |
+| 行字节数 / 32B | 1024、128，都整除 | 656，**不整除**（656 = 20×32 + 16） |
+| UB 内行间距 | 等于行字节数 | 向上取整到 **672 B**，否则第 2 行的局部地址只有 16B 对齐，`DataCopyPad` 不接受 |
+| 能否 `--group-rows > 1` 合并 | 能（三种模式都行） | **不能**：合并要求 UB 内行间距能被 32B 整除；656 的倍数里只有偶数行数才对齐，行间距本身永远不行 —— 合并会退化成逐行 |
+
+归零的一点：`--group-rows` 在 656 上仍然会**跑**，只是内部落到逐行路径，数字应与
+`group-rows=1` 一致（差值是噪声）。所以 656 的调优空间只剩 `--bank`（流水深度）和
+`--table-mode`（行表标量读），**没有** bf16 那 +8.6% 的合并收益。
+
+### 对照实验：672（补齐到 32B 整数倍）
+
+```bash
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 672 --kpe-dim 0 --dtype fp8 --sweep group-rows
+```
+
+672 = 21×32，合并路径全部可用。两个用途：
+
+1. 如果生产端愿意把行补齐到 672 B（16B 对齐本来就要占位），那么 `--ckv-dim 672` 的
+   `group-rows=4` 读数就是这条路的**上限**；
+2. 作为**回归对照**：656 与 672 的 `group-rows=1` 读数应该非常接近（差 16/656 = 2.4%
+   的搬运量），如果 656 明显更慢或 `--verify` 报错，说明问题出在「非 32B 对齐行」本身，
+   而不是数据量。
+
+### 改了算子 ABI，两个产物都要重编
+
+这一版给 aclnn 增加了第 11 个参数 `copy_rope`，并给 def 增加了 fp8/uint8 的 dtype 组合，
+所以**算子包和 torch 扩展必须一起重编**，只重编一个会报：
+
+- `no matching function for call to 'aclnnScatterCopyUbBenchGetWorkspaceSize'` → 算子包没重编；
+- `scatter_copy_ub_bench() expected 11 arguments` / `argument 'copy_rope' not found` → 扩展没重编。
+
+```bash
+SOC_VERSION=ascend950 VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
+    pip install -e . --no-build-isolation
+find . -name 'vllm_ascend_C*.so' -delete   # 若 .so 时间戳比源文件新，先删再装
+```
+
+### 如果 656 的 `--verify` 失败
+
+`DataCopyPad` 在 GM 侧支持非 32B 对齐的长度，但**每次搬运的起始地址**是否也允许 16B 对齐，
+取决于 SoC/CANN 版本。这条路径的判据就是 `--verify`：
+
+```bash
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 \
+    --verify --verify-rows 0 --repeat-verify 20 --iters 1 --rounds 1
+```
+
+- 全过 → 656 单行 DMA 可用，直接看带宽；
+- 报 `torn or stale DMA` 且集中在奇偶行号上 → 起始地址对齐问题，生产端只能按 672 行布局
+  搬（或改成「偶数行合并成一次 1312B 搬运」，656×2 是 32B 整数倍）。
 
 ## host 侧带宽只有 42 GB/s：先分清是哪条链路
 
@@ -438,7 +517,9 @@ socket 的 DRAM 要么路由不通、要么不按地址位分口，靠页放置�
 
 ## 已知限制
 
-- 仅支持 FP16 / BF16；CKV、KPE 的行字节数必须是 32B 对齐（默认 512/64 维天然满足）。
+- 支持 BF16 / FP16 / FP8(e4m3fn) / UINT8。行字节数**不再要求** 32B 对齐：非 32B 整数倍的行
+  （如 fp8 656B）走逐行路径，UB 内每行按 32B 向上取整（656 → 672）落位；代价是这种情况下
+  `--group-rows > 1` 不能合并（合并要求 UB 内行间距能被 32B 整除）。
 - `group-rows > 1` 只有在**源行连续**（`src_rows` 步长为 1）时才会合并读侧 DMA；
   写侧允许任意正向步长，与生产里 miss pair 的合并写一致。随机行表下会退化成逐行 DMA，
   这正是我们想看到的「合并能不能用」的结论。

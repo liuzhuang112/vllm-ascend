@@ -3,13 +3,14 @@
  * \file scatter_copy_ub_bench_def.cpp
  * \brief Operator definition of the DRAM -> HBM copy microbenchmark.
  *
- * The four metadata/attribute knobs are deliberately explicit so a single
+ * The five metadata/attribute knobs are deliberately explicit so a single
  * Python call can describe one measurement point:
  *
  *   bank_num    UB slots of the TQueBind software pipeline (1 => no overlap)
  *   group_rows  rows merged into one DataCopyPad (1 => one token per DMA)
  *   table_mode  0 = identity rows, 1 = read src/dst row tables like production
  *   core_num    AIV blocks to launch, 0 = all available
+ *   copy_rope   1 = also move the KPE plane, 0 = CKV plane only
  */
 
 #include "register/op_def_registry.h"
@@ -20,10 +21,16 @@ class ScatterCopyUbBench : public OpDef {
 public:
     explicit ScatterCopyUbBench(const char *name) : OpDef(name)
     {
+        // Each DataType entry is one complete dtype combination. fp8 carries no
+        // arithmetic here -- the copy is byte wide -- so uint8 is supported as
+        // the same instantiation, which also lets a caller avoid the fp8 tensor
+        // factory restrictions when only the DMA cost matters.
         this->Input("src_kv").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16}).FormatList({ge::FORMAT_ND}).AutoContiguous();
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("src_rope").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16}).FormatList({ge::FORMAT_ND}).AutoContiguous();
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("src_rows").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("dst_rows").ParamType(REQUIRED)
@@ -36,11 +43,14 @@ public:
         this->Attr("group_rows").AttrType(REQUIRED).Int(1);
         this->Attr("table_mode").AttrType(REQUIRED).Int(1);
         this->Attr("core_num").AttrType(REQUIRED).Int(0);
+        this->Attr("copy_rope").AttrType(REQUIRED).Int(1);
 
         this->Output("dst_kv").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16}).FormatList({ge::FORMAT_ND});
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .FormatList({ge::FORMAT_ND});
         this->Output("dst_rope").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16}).FormatList({ge::FORMAT_ND});
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .FormatList({ge::FORMAT_ND});
 
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)
