@@ -250,6 +250,7 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | `--cores` | 启动的 AIV 数，`0` = 全部 | 8 / 16 / 24 / 48 |
 | `--src` | `npu` = 源在 HBM；`host` = 源在 host pinned 内存 | npu / host |
 | `--host-interleave` | 配合 `--src host`：以 `numactl --interleave=all` 重启，让源页跨 NUMA node（两个 host 口的场景） | 开关 |
+| `--json` | 每个 case 输出一行 JSON（供 `host_link_scale.py` 之类脚本汇总），不再打印表格 | 开关 |
 | `--verify-rows` | 校验多少行，`0` = 全部 | 64 / 0 |
 | `--repeat-verify` | 重复跑并重复校验的次数（抓偶发） | 20 |
 
@@ -257,63 +258,77 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 标量读**的代价。生产 kernel 里这部分开销与 DMA 是串行的，通常就是 ScatterCopy 时延里
 最容易被忽略的一块。
 
-## 怎么让 host 侧的 2 个 UB 口一起工作
+## host 侧带宽只有 42 GB/s：先分清是哪条链路
 
-典型读数：`--src npu` 130 GB/s、`--src host` 42 GB/s。42 GB/s 正好落在**单条**高速链路
-的饱和区（PCIe Gen5 x16 有效 ~50、400G 类口 ~45–47），所以第一步不是改 kernel，而是
-确认到底有几个口在动。
+典型读数：`--src npu` 130 GB/s、`--src host` 42 GB/s。42 GB/s 落在**单条**高速链路的
+饱和区（PCIe Gen5 x16 有效 ~42–52、400G 类口 ~45–47），但"单条"不等于"只用了一个口" ——
+如果每口是 200G 级（25 GB/s），42 也可能已经是两个口合计。所以顺序是先定性，再谈调优。
 
-**1) 先量硬件上限，再判断我们离它多远**
+**1) 先确认 host 链路的类型，这一步决定后面所有结论**
 
 ```bash
-# 厂商工具给的是不经过 kernel 的 h2d 上限；它若 ~84 GB/s 而我们的 kernel 只有 42，
-# 说明瓶颈在 kernel 一侧的 DMA 发起方式，而不是链路
-ascend-dmi -bw -d 0 --type h2d -q
+lspci -tv                              # 加速卡挂在哪个 switch/root port
+lspci -s <卡的 BDF> -vv | grep -i lnksta   # 宽度与速率，例如 Width x16, Speed 32GT/s
+npu-smi info -t topo                  # 厂商视角的 host/device 连接方式（PCIe / UB）
+lscpu | grep -i numa ; cat /sys/devices/system/node/online
 ```
 
-**2) 数清楚本次运行用了几个口**（`benchmarks/kernel/ub_port_probe.py` 会前后采样所有
-`hccn_tool` 口与 `/sys/class/net/*` 计数器，打印每口的增量与 GB/s）
+- 若 host 侧是 **PCIe Gen5 x16**：42 GB/s 已经接近这条链路做 DMA 的实际上限（理论 63，
+  实际拷贝通常 42–52），此时"第二个口"多指芯片内部 die 之间的 UB，host 侧没有可再开的
+  通路，改 kernel 也拿不到额外带宽。
+- 若 host 侧确实是 **UB** 且有两个口：继续第 2 步。
+
+**2) 端口计数器只在链路以"端口设备"形式暴露时才有意义**
 
 ```bash
 python benchmarks/kernel/ub_port_probe.py -- \
     python benchmarks/kernel/scatter_copy_ub_bench.py --src host --iters 2000 --rounds 1
 ```
 
-只有一行为非零 = 单口跑满；两行各占一半 = 两个口都用了。
+脚本会前后采样 `hccn_tool -i N -stat -g`（Ascend 端口设备，工具路径会自动在
+`/usr/local/Ascend/driver/tools` 等位置查找）与 `/sys/class/net/*/statistics`，按设备打印
+rx/tx 增量与 GB/s。
 
-**3) 让 host 页跨 NUMA node 分布（最省事的一个杠杆）**
+**关键判读**：如果输出里只有 `net:enpXX` 这类普通网卡、且速率只有几 MB/s，那是 SSH/管理
+流量，**不代表 host→device 通路** —— 说明这条链路不以 netdev 形式暴露，计数器这条路走不
+通，直接跳到第 3 步。只有出现 `hccn*` 行（或多块网卡有 GB 级增量）时，"几行为非零 = 几个口"
+才成立。
 
-单口跑满通常是因为源页全落在一个 NUMA node 上，而每个 node 各对应一个 host 口：
+**3) 不依赖计数器的决定性实验：看带宽能不能叠加**
+
+```bash
+python benchmarks/kernel/host_link_scale.py --procs 2 --rows 1024 --iters 2000 --cores 20
+```
+
+脚本先单进程测一次，再并发 N 个进程（有 numactl 时各自绑一个 NUMA node），比较总和：
+
+| 结果 | 结论 |
+|:---|:---|
+| 合计 ≈ N × 单进程 | host 通路**可叠加**，单实例吃不满：值得做双窗口/kernel 侧拆分 |
+| 合计 ≈ 单进程 | 通路或共用适配器已饱和，并行与改 kernel 都拿不到带宽 |
+
+`--cores` 必须给（例如 40 核设备各给 20），否则先启动的内核占满 AIV，后一个只是在排队，
+测出来的"不叠加"是假象。
+
+**4) 页跨 NUMA node（只在第 1 步显示多 NUMA 时才有意义）**
 
 ```bash
 python benchmarks/kernel/scatter_copy_ub_bench.py --src host --host-interleave
-# 等价于 numactl --interleave=all python benchmarks/kernel/scatter_copy_ub_bench.py --src host
 ```
 
-`--host-interleave` 会在分配源之前用 `numactl --interleave=all` 重启自己（mempolicy 必须
-早于分配），此时两个 node 的页各承担一半读流量。若分配器忽略 task mempolicy（不影响本
-脚本里的 pinned 分配），回到第 2 步会看到仍然只有一个口。
+`--host-interleave` 在分配源之前用 `numactl --interleave=all` 重启自己（mempolicy 必须早于
+分配）。实测在单 NUMA 或路由不按页放置的机器上**没有变化**，这是正常结果：它只能解决
+"页全在一个 node 上"这一种成因，不能改变端口选择逻辑。
 
-**4) 拆进程验证“是不是单实例上限”**
+**5) 真要到改 kernel 时，方向是"两个注册窗口"**
 
-```bash
-numactl --cpunodebind=0 --membind=0 python benchmarks/kernel/scatter_copy_ub_bench.py \
-    --src host --rows 1024 --iters 2000 --rounds 1
-numactl --cpunodebind=1 --membind=1 python benchmarks/kernel/scatter_copy_ub_bench.py \
-    --src host --rows 1024 --iters 2000 --rounds 1
-```
-
-两个进程同时跑：各自 ~42 → 合计 ~84，说明两条链路可用、只是单实例走不到第二条，才值得
-改 kernel；两个加起来仍 ~42 → 瓶颈在共用资源（host 侧 UB 适配器 / 单卡 DMA 通道），改
-kernel 无意义。
-
-**5) 真要到改 kernel 时，方向是“两个注册窗口”**
-
-现在的 `--src host` 只有**一个**源指针，所有行都从同一段 host 区间读；即使页已经跨 node，
+现在的 `--src host` 只有**一个**源指针，所有行都从同一段 host 区间读；即使页跨 node，
 地址位落在一个连续区间里仍可能被路由到同一个口。要稳定用满两条，最小改动是给算子加第二个
 源指针：分配两段锁页内存、分别注册（各自 `aclrtHostGetDevicePointer`），kernel 按
 `row_bit = row & 1`（或按核号奇偶）选基址。这样每核的读请求天然分到两段地址区间，
 不依赖分配器的页放置策略。
+
+前提是第 3 步的合计能超过单进程；否则这层改动只会增加复杂度。
 
 ## 已知限制
 

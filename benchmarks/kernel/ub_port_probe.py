@@ -37,6 +37,36 @@ import time
 SKIP_IFACE_PREFIXES = ("lo", "docker", "veth", "br-", "virbr", "tun", "tap")
 COUNTER_RE = re.compile(r"([A-Za-z][A-Za-z0-9_]*)\s*[:=]\s*(\d+)")
 BYTE_COUNTERS = ("rx_bytes", "tx_bytes", "rx_byte", "tx_byte", "rx_packets", "tx_packets")
+# The driver tools are not usually on PATH, which silently reduced an earlier run
+# to plain netdev counters -- i.e. it measured SSH traffic instead of the host
+# link. Look in the standard install locations as well.
+TOOL_DIRS = (
+    "/usr/local/Ascend/driver/tools",
+    "/usr/local/Ascend/latest/driver/tools",
+    "/usr/local/Ascend/ascend-toolkit/latest/tools",
+    "/usr/local/bin",
+    "/usr/bin",
+)
+BACKENDS: list[str] = []
+
+
+def find_tool(name: str) -> str | None:
+    found = shutil.which(name)
+    if found:
+        return found
+    candidates = list(TOOL_DIRS)
+    home = os.environ.get("ASCEND_HOME_PATH", "")
+    if home:
+        candidates[:0] = [
+            os.path.join(home, os.pardir, "driver", "tools"),
+            os.path.join(home, "tools"),
+            os.path.join(home, "bin"),
+        ]
+    for base in candidates:
+        path = os.path.normpath(os.path.join(base, name))
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
 
 
 def parse_ports(spec: str) -> list[int]:
@@ -68,14 +98,18 @@ def netdev_counters() -> dict[str, int]:
                     counters[f"net:{iface}:{name}"] = int(handle.read().strip())
             except (OSError, ValueError):
                 continue
+    if counters and "netdev" not in BACKENDS:
+        BACKENDS.append("netdev")
     return counters
 
 
 def hccn_counters(ports: list[int]) -> dict[str, int]:
-    tool = shutil.which("hccn_tool")
+    tool = find_tool("hccn_tool")
     counters: dict[str, int] = {}
     if tool is None:
         return counters
+    if "hccn_tool" not in BACKENDS:
+        BACKENDS.append(f"hccn_tool ({tool})")
     for port in ports:
         try:
             out = subprocess.run(
@@ -140,8 +174,9 @@ def summarize(before: dict[str, int], after: dict[str, int], seconds: float) -> 
 
 
 def topo_dump() -> None:
-    tool = shutil.which("npu-smi")
+    tool = find_tool("npu-smi")
     if tool is None:
+        print("npu-smi not found: cannot show the host/device topology\n")
         return
     try:
         out = subprocess.run(
@@ -198,6 +233,18 @@ def main(argv=None) -> int:
         )
         return 2
     print(f"sampled {len(before)} counters over {len({device_of(k) for k in before})} devices")
+    print(f"backends: {', '.join(BACKENDS) if BACKENDS else 'none'}")
+    if "hccn_tool" not in " ".join(BACKENDS):
+        print(
+            "warning: hccn_tool was not found, so no Ascend port device was sampled.\n"
+            "  The rows below are ordinary NICs and do NOT show the host->device path:\n"
+            "  a few MB/s there is ssh/management traffic, not the DMA.\n"
+            "  Point at the tool explicitly, e.g.\n"
+            "    ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest \\\n"
+            "      python benchmarks/kernel/ub_port_probe.py -- ...\n"
+            "  or confirm the host link type with lspci / npu-smi before trusting counts.",
+            file=sys.stderr,
+        )
 
     started = time.monotonic()
     code = subprocess.call(command)

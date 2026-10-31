@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
 import os
 import shutil
 import statistics
@@ -581,6 +582,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print one JSON record per case on stdout (for host_link_scale.py); the "
+        "human-readable table is suppressed",
+    )
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--verify", action="store_true", help="check copied rows before timing")
@@ -654,12 +661,33 @@ def main(argv=None) -> int:
                 bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
             us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
             gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
-            print(
-                f"{label:>18} {case.rows:>7} {case.group_rows:>5} {case.bank:>4} "
-                f"{case.table_mode:>3} {case.cores:>5} {us_min:>9.1f} {gbps:>8.1f}"
-            )
-            if us_med != us_min:
-                print(f"{'':>18} median {us_med:.1f} us")
+            if args.json:
+                # One record per point on stdout, nothing else, so a driver script
+                # (host_link_scale.py) can aggregate several processes.
+                print(
+                    json.dumps(
+                        {
+                            "label": label,
+                            "src": case.src,
+                            "rows": case.rows,
+                            "group_rows": case.group_rows,
+                            "bank": case.bank,
+                            "table_mode": case.table_mode,
+                            "cores": case.cores,
+                            "us": us_min,
+                            "us_median": us_med,
+                            "gbps": gbps,
+                        }
+                    ),
+                    flush=True,
+                )
+            else:
+                print(
+                    f"{label:>18} {case.rows:>7} {case.group_rows:>5} {case.bank:>4} "
+                    f"{case.table_mode:>3} {case.cores:>5} {us_min:>9.1f} {gbps:>8.1f}"
+                )
+                if us_med != us_min:
+                    print(f"{'':>18} median {us_med:.1f} us")
         finally:
             # Host sources stay registered (and the device may still be reading
             # them) until every launch has retired.
