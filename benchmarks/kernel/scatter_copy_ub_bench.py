@@ -129,6 +129,57 @@ def _op_registered() -> bool:
     return hasattr(torch.ops._C_ascend, OP_NAME)
 
 
+# --- what one row's DMA costs -------------------------------------------------
+# Fit to --sweep ckv-dim on A5 (host -> HBM, one DataCopyPad per row, 32 AIV):
+#
+#     len B   ns/row   charged   ns per 256 B
+#     384      12.4      512         6.21
+#     512      12.4      512         6.21
+#     576      17.7      768         5.91
+#     640      17.7      768         5.91
+#     656      20.5      768         6.83   <- tail 144 B > 128 B
+#     672      20.6      768         6.85   <- tail 160 B
+#     704      20.6      768         6.86   <- tail 192 B
+#     768      18.4      768         6.14
+#     896      23.1     1024         5.77
+#    1024      23.1     1024         5.78
+#
+# Two things fall out of it: the transfer is charged in 256 B granules (384 and
+# 512 cost the same, 576/640/656/672/704/768 all cost the same), and a tail that
+# crosses the half-granule boundary (len % 256 > 128) adds ~2.7 ns. The fit is
+# within 4% on all ten points. It is an empirical model of one machine, not a
+# documented rule -- which is why the hint below is printed as a hint.
+DMA_GRANULE_BYTES = 256
+DMA_NS_PER_GRANULE = 6.0
+DMA_TAIL_SURCHARGE_NS = 2.7
+
+
+def dma_cost_hint(row_bytes: int) -> str:
+    """Explain what one row's DMA is charged for, and the cheapest padded row."""
+    units = -(-row_bytes // DMA_GRANULE_BYTES)
+    rem = row_bytes % DMA_GRANULE_BYTES
+    surcharge = DMA_TAIL_SURCHARGE_NS if rem > DMA_GRANULE_BYTES // 2 else 0.0
+    base_ns = units * DMA_NS_PER_GRANULE
+    ns = base_ns + surcharge
+    charged = units * DMA_GRANULE_BYTES
+    text = f"DMA: {row_bytes} B/row is charged as {charged} B ({units} x 256 B)"
+    if surcharge:
+        return (
+            f"{text}, and the {rem} B tail (> 128 B) adds ~{DMA_TAIL_SURCHARGE_NS:.1f} ns "
+            f"-> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful). Padding the row to "
+            f"{charged} B keeps the same payload in ~{base_ns:.1f} ns "
+            f"(~{row_bytes / base_ns:.0f} GB/s useful, {100 * (1 - base_ns / ns):.0f}% less "
+            f"time per row)"
+        )
+    if charged > row_bytes:
+        return (
+            f"{text} -> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful). The remaining "
+            f"{charged - row_bytes} B of the granule are free: filling the row up to {charged} B "
+            f"costs no extra time"
+        )
+    return f"{text} -> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful)"
+
+
 def _custom_op_gate() -> str | None:
     """Why ``enable_custom_op()`` refuses to load the extension, if it does.
 
@@ -811,11 +862,11 @@ def main(argv=None) -> int:
         f"row: {base.ckv_dim} elems CKV"
         + (f" + {base.kpe_dim} elems KPE" if base.copy_rope else " (KPE plane off)")
         + f", {args.dtype}, {row_bytes} B/token"
-        + ("" if base.run_len <= 1 else f", runs of {base.run_len} consecutive rows")
-        + ("" if row_bytes % 32 == 0 else ", not a multiple of 32 B -> per-row DMA only"),
+        + ("" if base.run_len <= 1 else f", runs of {base.run_len} consecutive rows"),
         file=sys.stderr,
         flush=True,
     )
+    print(f"     {dma_cost_hint(row_bytes)}", file=sys.stderr, flush=True)
 
     points: list[tuple[str, Case]] = []
     if args.sweep == "none":
@@ -826,7 +877,7 @@ def main(argv=None) -> int:
             points.append((f"{args.sweep}={value}", case))
 
     header = f"{'case':>18} {'rows':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
-    header += f"{'us':>9} {'GB/s':>8}"
+    header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8}"
     print(header)
     print("-" * len(header))
     for label, case in points:
@@ -857,16 +908,19 @@ def main(argv=None) -> int:
                             "cores": case.cores,
                             "us": us_min,
                             "us_median": us_med,
+                            "ns_per_row": us_min * 1000.0 / case.rows,
                             "gbps": gbps,
                         }
                     ),
                     flush=True,
                 )
             else:
+                # ns/row is the number that matters when comparing row lengths:
+                # GB/s hides the fact that the DMA is charged in 256 B granules.
                 print(
                     f"{label:>18} {case.rows:>7} {case.row_bytes:>6} {case.group_rows:>5} "
                     f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
-                    f"{us_min:>9.1f} {gbps:>8.1f}"
+                    f"{us_min:>9.1f} {us_min * 1000.0 / case.rows:>7.1f} {gbps:>8.1f}"
                 )
                 if us_med != us_min:
                     print(f"{'':>18} median {us_med:.1f} us")
