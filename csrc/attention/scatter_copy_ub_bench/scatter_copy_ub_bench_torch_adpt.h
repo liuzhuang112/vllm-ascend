@@ -43,10 +43,10 @@ inline void scatter_copy_ub_bench(
               "scatter_copy_ub_bench: row tables must be non-empty and equal length.");
 
   const auto dtype = src_kv.scalar_type();
-  TORCH_CHECK(dtype == at::kHalf || dtype == at::kBFloat16 ||
-                  dtype == at::kFloat8_e4m3fn || dtype == at::kByte,
-              "scatter_copy_ub_bench: only fp16, bf16, fp8_e4m3fn and uint8 are "
-              "supported.");
+  TORCH_CHECK(dtype == at::kHalf || dtype == at::kBFloat16 || dtype == at::kByte,
+              "scatter_copy_ub_bench: only fp16, bf16 and uint8 are supported "
+              "(a 1-byte cache row is measured through uint8: the op copies "
+              "bytes and never interprets them).");
   for (const at::Tensor* tensor :
        std::array<const at::Tensor*, 3>{&src_rope, &dst_kv, &dst_rope}) {
     TORCH_CHECK(tensor->scalar_type() == dtype,
@@ -58,8 +58,8 @@ inline void scatter_copy_ub_bench(
               "scatter_copy_ub_bench: row tables must be int32.");
 
   const int64_t elem_size = static_cast<int64_t>(src_kv.element_size());
-  // Row length is no longer required to be a multiple of 32 B: DataCopyPad pads
-  // the UB side itself, which is what makes a fp8 row of 656 B (= 512 nope + 16
+  // Row length is not required to be a multiple of 32 B: DataCopyPad pads the UB
+  // side itself, which is what makes a 656 B single-plane row (512 nope + 16
   // scale + 128 rope) copyable at all. Rows that are not a multiple of 32 B take
   // the per-row path in the kernel (each row is placed at a 32 B aligned UB
   // offset), so group_rows cannot be coalesced for them -- a throughput

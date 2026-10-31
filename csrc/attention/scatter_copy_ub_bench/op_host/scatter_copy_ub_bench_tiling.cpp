@@ -88,9 +88,9 @@ ge::graphStatus Tiling4ScatterCopyUbBench(gert::TilingContext *context)
     } else if (dataTypeValue == ge::DT_FLOAT16) {
         dataType = 2;
         elemBytes = 2;
-    } else if (dataTypeValue == ge::DT_FLOAT8_E4M3FN || dataTypeValue == ge::DT_UINT8) {
-        // An fp8 cache is copied byte for byte; there is no arithmetic involved,
-        // so the kernel rides its uint8_t instantiation.
+    } else if (dataTypeValue == ge::DT_UINT8) {
+        // A 1-byte cache row is copied byte for byte; there is no arithmetic
+        // involved, so the kernel rides its uint8_t instantiation.
         dataType = 3;
         elemBytes = 1;
     } else {
@@ -107,7 +107,7 @@ ge::graphStatus Tiling4ScatterCopyUbBench(gert::TilingContext *context)
 
     // One slot holds groupRows CKV rows plus the same number of KPE rows. Each
     // plane is measured in 32 B aligned rows, exactly like the kernel's UB row
-    // stride: an fp8 row of 656 B occupies 672 B in UB, and the tiling has to
+    // stride: a 1-byte row of 656 B occupies 672 B in UB, and the tiling has to
     // budget for that or the kernel's InitBuffer would overrun the queue.
     const int64_t ubRowBytes = AlignUp(ckvDim * elemBytes, UB_ALIGN_BYTES);
     const int64_t kpeRowBytes = copyRope ? AlignUp(kpeDim * elemBytes, UB_ALIGN_BYTES) : 0;

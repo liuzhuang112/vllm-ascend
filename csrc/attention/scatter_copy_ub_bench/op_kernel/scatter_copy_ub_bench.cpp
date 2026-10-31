@@ -24,9 +24,10 @@
  *
  * Row layout. Two planes are copied per token, exactly like the paged K/V cache
  * the production op walks: a CKV plane (ckv_dim elements) and a KPE plane
- * (kpe_dim elements). Either plane may be byte-sized (fp8 / uint8), and the KPE
- * plane may be switched off entirely (copy_rope = 0), which is what the
- * DeepSeek-style fp8 MLA cache needs: one 656 B row, no separate rope plane.
+ * (kpe_dim elements). Either plane may be byte-sized (uint8, i.e. a 1-byte
+ * cache such as a quantised MLA row), and the KPE plane may be switched off
+ * entirely (copy_rope = 0), which is the DeepSeek-style layout where rope lives
+ * inside the single 656 B row.
  *
  * Differences from the production kernel (all of them are knobs here):
  *   - bank_num / group_rows / core_num are runtime parameters instead of
@@ -54,9 +55,9 @@ constexpr uint32_t SCB_MAX_GROUP_ROWS = 8;
 /**
  * How one group's rows are laid out in UB and moved by DMA.
  *
- * The distinction only matters when a row is not a multiple of 32 B: an fp8 row
- * of 656 B cannot be placed at `r * 656` in UB, because DataCopyPad requires a
- * 32 B aligned LocalTensor. GROUP_MODE_ROWS therefore pads every row to the next
+ * The distinction only matters when a row is not a multiple of 32 B: a 656 B
+ * row cannot be placed at `r * 656` in UB, because DataCopyPad requires a 32 B
+ * aligned LocalTensor. GROUP_MODE_ROWS therefore pads every row to the next
  * 32 B (656 -> 672) and copies row by row, while the two coalesced modes keep
  * the rows tight and never address one row individually, so they work for any
  * row length -- but they can only be used when the rows really are consecutive
@@ -94,9 +95,9 @@ public:
         usedCoreNum_ = static_cast<uint32_t>(tiling.usedCoreNum);
         tableMode_ = tiling.tableMode;
 
-        // UB row stride, not the row length: a 656 B fp8 row occupies 672 B so
-        // that the next row still starts on a 32 B boundary. For every row that
-        // is already a multiple of 32 B (bf16/fp16 caches) this is a no-op.
+        // UB row stride, not the row length: a 656 B row occupies 672 B so that
+        // the next row still starts on a 32 B boundary. For every row that is
+        // already a multiple of 32 B (bf16/fp16 caches) this is a no-op.
         ubRowElems_ = AlignBytesToElems(ckvDim_ * static_cast<int64_t>(sizeof(T)));
         kpeUbRowElems_ = copyRope_ ? AlignBytesToElems(kpeDim_ * static_cast<int64_t>(sizeof(T))) : 0;
         // The KPE plane starts on the 32 B boundary after `groupRows_` CKV slots,
@@ -378,9 +379,9 @@ extern "C" __global__ __aicore__ void scatter_copy_ub_bench(GM_ADDR srcKv, GM_AD
 
     TPipe pipe;
     // Every instantiation is compiled here on purpose: the element type is a
-    // runtime field, so the op needs no tiling-key registration. fp8 has no
-    // arithmetic here -- the copy is byte-wide, so it rides the uint8_t
-    // instantiation.
+    // runtime field, so the op needs no tiling-key registration. A 1-byte cache
+    // row has no arithmetic here -- the copy is byte-wide, so it rides the
+    // uint8_t instantiation.
     if (tilingData.dataType == 2) {
         ScatterCopyUbBenchKernel<half, SCB_MAX_BANKS> op;
         op.Init(srcKv, srcRope, srcRows, dstRows, dstKv, dstRope, tilingData, &pipe);

@@ -16,14 +16,16 @@ per direction.
 Defaults reproduce the bf16 MLA cache: CKV 512 + KPE 64 = 1152 B per token.
 Two other shapes matter in practice and are one flag away:
 
-    # DeepSeek-style fp8 MLA cache: one 656 B row, no separate rope plane
+    # DeepSeek-style quantised MLA cache: one 656 B row, no separate rope plane.
+    # The row is copied byte-wide, so uint8 is the dtype to use -- the op never
+    # interprets the payload and this way it needs no fp8 support from the part.
     python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 \
-        --ckv-dim 656 --kpe-dim 0 --dtype fp8
+        --ckv-dim 656 --kpe-dim 0 --dtype uint8
 
-    # the padded variant of the same row, for comparison: 672 B is a whole
-    # number of 32 B units, so it keeps the coalescing paths alive
+    # where does the per-row DMA slow down? sweep the row length instead of
+    # guessing: 512 and 1024 are 128 B multiples, 656/672 are not (see below)
     python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 \
-        --ckv-dim 672 --kpe-dim 0 --dtype fp8 --sweep group-rows
+        --kpe-dim 0 --dtype uint8 --src host --sweep ckv-dim
 
 Source placement decides what is being measured:
 
@@ -91,11 +93,10 @@ torch_npu = None
 CKV_DIM = 512
 KPE_DIM = 64
 OP_NAME = "scatter_copy_ub_bench"
-# Element size of each supported cache dtype, in bytes. fp8 has no arithmetic
-# here -- the op moves bytes -- so uint8 is accepted as the same instantiation.
+# Element size of each supported cache dtype, in bytes. A 1-byte cache row (a
+# quantised MLA row, for instance) is measured through uint8: the op moves bytes
+# and never interprets them, so no fp8 dtype has to exist on the part.
 DTYPES = {"bf16": (torch.bfloat16, 2), "fp16": (torch.float16, 2), "uint8": (torch.uint8, 1)}
-if hasattr(torch, "float8_e4m3fn"):
-    DTYPES["fp8"] = (torch.float8_e4m3fn, 1)
 # ``torch.pin_memory()`` only locks pages; it does not publish the range to the
 # device. ``aclrtHostRegisterV2`` does, and the payload is then aligned to this
 # boundary -- engram/npu.py aligns to 64 KiB because unaligned device reads of a
@@ -326,10 +327,10 @@ def _random_values(rows: int, dim: int, dtype: torch.dtype, gen: torch.Generator
     """Random payload of the right dtype.
 
     Only the byte pattern matters to the copy, and it must be non-degenerate so
-    the verifier can tell a torn row from a row that was never written. Both
-    1-byte dtypes are therefore filled with raw bytes and reinterpreted: fp8 has
-    no randn/compare kernel on every torch build, and a NaN-heavy payload would
-    still compare unequal if it went through float arithmetic.
+    the verifier can tell a torn row from a row that was never written. A 1-byte
+    dtype is therefore filled with raw bytes rather than through float
+    arithmetic, which keeps the payload free of NaN and of any dtype-specific
+    random kernel.
     """
     if _elem_size(dtype) == 1:
         raw = torch.randint(0, 256, (rows, dim), generator=gen, dtype=torch.uint8)
@@ -338,8 +339,36 @@ def _random_values(rows: int, dim: int, dtype: torch.dtype, gen: torch.Generator
 
 
 def _comparable(t: torch.Tensor) -> torch.Tensor:
-    """View 1-byte dtypes as uint8 so comparisons never touch fp8 arithmetic."""
+    """View a 1-byte dtype as uint8 so the comparison is a plain byte compare."""
     return t.view(torch.uint8) if t.element_size() == 1 else t
+
+
+def _run_table(total: int, count: int, run_len: int, gen: torch.Generator) -> torch.Tensor:
+    """Row indices for a ``count``-token gather/scatter over ``total`` rows.
+
+    ``run_len == 1`` is the worst case for the copy and the default: a full
+    permutation, so two consecutive tokens never share neighbouring rows and no
+    group can ever be coalesced. ``run_len > 1`` emits random *runs* of
+    consecutive rows, which is what a topk selection looks like when the picked
+    blocks are adjacent. That makes the mergeable fraction a measured input
+    instead of an assumption -- the whole point of ``--run-len``.
+    """
+    if run_len <= 1 or count < run_len:
+        return torch.randperm(total, generator=gen)[:count]
+    n_runs = count // run_len
+    # Distinct run starts mean the table stays a set of unique row indices, so
+    # two tokens can never write the same destination slot (which would make
+    # --verify compare a row that a later token overwrote).
+    blocks = total // run_len
+    starts = torch.randperm(blocks, generator=gen)[:n_runs] * run_len
+    idx = (starts[:, None] + torch.arange(run_len)[None, :]).reshape(-1)
+    if idx.numel() < count:
+        # Token count not divisible by run_len: the tail tokens are single rows.
+        used = torch.zeros(total, dtype=torch.bool)
+        used[idx] = True
+        free = torch.nonzero(~used).flatten()
+        idx = torch.cat([idx, free[: count - idx.numel()]])
+    return idx[:count]
 
 
 @dataclass
@@ -354,6 +383,7 @@ class Case:
     device: int = 0
     ckv_dim: int = CKV_DIM
     kpe_dim: int = KPE_DIM
+    run_len: int = 1
 
     @property
     def copy_rope(self) -> bool:
@@ -387,8 +417,10 @@ class Bench:
         # Sparse topk selection is a random gather from DRAM into a random slot,
         # so both tables are full permutations. Destinations are spread over 4x
         # the row count so the scatter is not a disguised sequential copy.
-        self.src_rows = torch.randperm(rows, generator=gen).to(torch.int32)
-        self.dst_rows = (torch.randperm(rows * 4, generator=gen)[:rows]).to(torch.int32)
+        # --run-len > 1 keeps that shape but makes runs of consecutive rows,
+        # which is the only case a group of rows can be coalesced into one DMA.
+        self.src_rows = _run_table(rows, rows, case.run_len, gen).to(torch.int32)
+        self.dst_rows = _run_table(rows * 4, rows, case.run_len, gen).to(torch.int32)
 
         self.src_kv_dev, self.src_kv_cpu = self._make_source(rows, case.ckv_dim, gen)
         self.dst_kv = torch.zeros(rows * 4, case.ckv_dim, dtype=case.dtype, device=self.device)
@@ -660,20 +692,27 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=int,
         default=CKV_DIM,
         help=f"elements per row in the CKV plane (default {CKV_DIM}); multiplied by the "
-        "dtype size to get the row bytes, e.g. 656 fp8 bytes for the DeepSeek-style "
-        "MLA cache",
+        "dtype size to get the row bytes, e.g. 656 B for the DeepSeek-style MLA "
+        "row (512 nope + 16 scale + 128 rope) with --dtype uint8",
     )
     parser.add_argument(
         "--kpe-dim",
         type=int,
         default=KPE_DIM,
         help=f"elements per row in the KPE plane (default {KPE_DIM}); 0 disables the plane "
-        "entirely (copy_rope=0), which is the fp8 layout where the rope part is part of "
-        "the 656 B row",
+        "entirely (copy_rope=0), which is the layout where rope is part of the CKV row",
     )
     parser.add_argument("--bank", type=int, default=2, help="UB pipeline depth (1 disables overlap)")
     parser.add_argument("--group-rows", type=int, default=1, help="rows merged into one DataCopyPad")
     parser.add_argument("--table-mode", type=int, default=1, help="1 = gather/scatter via row tables, 0 = identity")
+    parser.add_argument(
+        "--run-len",
+        type=int,
+        default=1,
+        help="rows per run of consecutive indices in the row tables (default 1 = a full "
+        "permutation, i.e. nothing is coalescible). Use it to measure --group-rows at a "
+        "realistic topk locality instead of the worst case",
+    )
     parser.add_argument("--cores", type=int, default=0, help="AIV blocks to launch, 0 = all")
     parser.add_argument("--src", choices=("npu", "host"), default="npu", help="source placement")
     parser.add_argument(
@@ -693,8 +732,8 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--dtype",
         choices=tuple(DTYPES),
         default="bf16",
-        help="cache element type; fp8 and uint8 are copied byte-wide, so they measure the "
-        "same DMA path (uint8 is the escape hatch when no fp8 tensor factory is available)",
+        help="cache element type; a 1-byte cache row is measured through uint8, which is "
+        "copied byte-wide like any other row",
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument(
@@ -721,7 +760,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--sweep",
-        choices=("none", "group-rows", "bank", "table-mode", "cores", "src"),
+        choices=("none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim"),
         default="none",
         help="iterate one knob instead of measuring a single point",
     )
@@ -735,6 +774,11 @@ def sweep_values(name: str) -> list:
         "table-mode": [0, 1],
         "cores": [8, 16, 24, 32, 48],
         "src": ["npu", "host"],
+        # 384/512/640/768/896/1024 are multiples of 128 B, 576/704 are only
+        # multiples of 64 B, and 656/672 are the two real MLA rows (512 nope +
+        # 16 scale + 128 rope, and the same row padded to 32 B). Comparing the
+        # three groups is what tells a length penalty from an alignment one.
+        "ckv-dim": [384, 512, 576, 640, 656, 672, 704, 768, 896, 1024],
     }[name]
 
 
@@ -760,12 +804,14 @@ def main(argv=None) -> int:
         device=args.device,
         ckv_dim=args.ckv_dim,
         kpe_dim=args.kpe_dim,
+        run_len=args.run_len,
     )
     row_bytes = base.row_bytes
     print(
         f"row: {base.ckv_dim} elems CKV"
         + (f" + {base.kpe_dim} elems KPE" if base.copy_rope else " (KPE plane off)")
         + f", {args.dtype}, {row_bytes} B/token"
+        + ("" if base.run_len <= 1 else f", runs of {base.run_len} consecutive rows")
         + ("" if row_bytes % 32 == 0 else ", not a multiple of 32 B -> per-row DMA only"),
         file=sys.stderr,
         flush=True,
@@ -805,6 +851,7 @@ def main(argv=None) -> int:
                             "ckv_dim": case.ckv_dim,
                             "kpe_dim": case.kpe_dim,
                             "group_rows": case.group_rows,
+                            "run_len": case.run_len,
                             "bank": case.bank,
                             "table_mode": case.table_mode,
                             "cores": case.cores,

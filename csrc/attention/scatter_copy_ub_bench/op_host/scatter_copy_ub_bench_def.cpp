@@ -21,15 +21,15 @@ class ScatterCopyUbBench : public OpDef {
 public:
     explicit ScatterCopyUbBench(const char *name) : OpDef(name)
     {
-        // Each DataType entry is one complete dtype combination. fp8 carries no
-        // arithmetic here -- the copy is byte wide -- so uint8 is supported as
-        // the same instantiation, which also lets a caller avoid the fp8 tensor
-        // factory restrictions when only the DMA cost matters.
+        // Each DataType entry is one complete dtype combination. The copy is
+        // byte wide, so a 1-byte cache row is measured through DT_UINT8: the
+        // kernel moves bytes and never interprets them, which keeps this op
+        // usable on parts whose toolchain has no fp8 tensor path at all.
         this->Input("src_kv").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_UINT8})
             .FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("src_rope").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_UINT8})
             .FormatList({ge::FORMAT_ND}).AutoContiguous();
         this->Input("src_rows").ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32}).FormatList({ge::FORMAT_ND}).AutoContiguous();
@@ -46,10 +46,10 @@ public:
         this->Attr("copy_rope").AttrType(REQUIRED).Int(1);
 
         this->Output("dst_kv").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_UINT8})
             .FormatList({ge::FORMAT_ND});
         this->Output("dst_rope").ParamType(REQUIRED)
-            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_FLOAT8_E4M3FN, ge::DT_UINT8})
+            .DataType({ge::DT_BF16, ge::DT_FLOAT16, ge::DT_UINT8})
             .FormatList({ge::FORMAT_ND});
 
         OpAICoreConfig config;

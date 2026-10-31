@@ -11,7 +11,7 @@
 | `op_kernel/first_fill_scatter_copy_kernel.h` 的 `CopyIn` / `CopyOut` | `op_kernel/scatter_copy_ub_bench.cpp` 的同名函数 |
 | `TQueBind<VECIN, VECOUT, 2>` + `CopyIn(next) / CopyOut(cur)` 两槽软件流水 | `TQueBind<VECIN, VECOUT, BANK_COUNT>`，深度由 `bank_num` 指定，`bank_num - 1` 级预取 |
 | `srcTokenId → dram_block_table → (physicalBlock*128 + offset)` | `src_rows` / `dst_rows` 两张行表（`table_mode=1`） |
-| 每个 token 两次 `DataCopyPad`：CKV 1024B + KPE 128B | 不变（`group_rows=1` 时完全一致）；可用 `--ckv-dim / --kpe-dim / --dtype` 改成 fp8 的 656B 单平面 |
+| 每个 token 两次 `DataCopyPad`：CKV 1024B + KPE 128B | 不变（`group_rows=1` 时完全一致）；可用 `--ckv-dim / --kpe-dim / --dtype` 改成 1 字节的 656B 单平面 |
 | `usedCoreNum * 2` 个 AIV 按 `blockIdx + k*usedCoreNum` 取任务 | `cores` 个 AIV 按 group 步进取任务 |
 
 数据通路（与生产完全一致）：
@@ -201,8 +201,8 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --sweep table-mode
 # 若 torch_npu 已被提前 import，则先手动 export 该变量再运行。
 python benchmarks/kernel/scatter_copy_ub_bench.py --src host --verify
 
-# fp8 单平面行：每 token 656 B，没有 KPE 平面
-python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --verify
+# 单平面行：每 token 656 B，没有 KPE 平面（1 字节 cache，走 uint8 逐字节搬）
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 --verify
 ```
 
 输出示例：
@@ -247,9 +247,10 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | 参数 | 作用 | 建议扫描范围 |
 |:---|:---|:---|
 | `--rows` | 单次 launch 搬运的 token 行数 | 512 / 2048 / 8192 / 32768 |
-| `--ckv-dim` | CKV 平面每行元素数（默认 512）；乘 dtype 字节数就是行字节数，DeepSeek 系 fp8 MLA 用 656 | 512 / 656 / 672 |
+| `--ckv-dim` | CKV 平面每行元素数（默认 512）；乘 dtype 字节数就是行字节数，DeepSeek 系 1 字节 MLA 用 656 | 512 / 656 / 672 / 1024 |
 | `--kpe-dim` | KPE 平面每行元素数（默认 64）；`0` = 不搬 KPE（`copy_rope=0`） | 64 / 0 |
-| `--dtype` | `bf16` / `fp16` / `fp8`（`float8_e4m3fn`）/ `uint8`；后两者都是逐字节搬，走同一条 DMA 路径 | bf16 / fp8 |
+| `--dtype` | `bf16` / `fp16` / `uint8`。1 字节 cache 行一律用 `uint8`：算子只搬字节、不做算术，所以不需要该芯片支持 fp8 | bf16 / uint8 |
+| `--run-len` | 行表里连续行游程的长度。默认 1 = 全随机置换（合并率 0）；`4` 表示 4 行连续，接近 topk 命中相邻块时的形状 | 1 / 2 / 4 / 8 |
 | `--bank` | UB 流水槽数，`1` = 完全不重叠 | 1 / 2 / 3 / 4 / 6 / 8 |
 | `--group-rows` | 多少行合并成一次 `DataCopyPad`（源行连续时）；实测 4 行是效率平台（`--src host` 下 42.0 → 45.6 GB/s），8 行无收益 | 1 / 2 / 4 |
 | `--table-mode` | `1` = 走行表 `GetValue`（同生产）；`0` = 恒等寻址 | 0 / 1 |
@@ -265,54 +266,120 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 标量读**的代价。生产 kernel 里这部分开销与 DMA 是串行的，通常就是 ScatterCopy 时延里
 最容易被忽略的一块。
 
-## fp8 单平面行：CKV_DIM=656、KPE_DIM=0
+## 单平面 1 字节行：CKV_DIM=656、KPE_DIM=0（`--dtype uint8`）
 
-DeepSeek 系的 fp8 MLA 缓存把 rope 也塞进了同一行：**656 B = 512B nope(fp8) + 16B scale(fp32×4)
-+ 128B rope(bf16)**。这时没有独立的 KPE 平面，每 token 只有**一次** `DataCopyPad`。
+DeepSeek 系的量化 MLA 缓存把 rope 塞进同一行：**656 B = 512 B nope + 16 B scale(fp32×4) +
+128 B rope(bf16)**。这时没有独立的 KPE 平面，每 token 只有**一次** `DataCopyPad`。
+
+1 字节行一律用 `--dtype uint8`：算子只搬字节、不解释内容，所以既不需要芯片支持 fp8，也不需要
+torch 的 fp8 张量工厂。fp8 已经从这个算子里删干净了（def 的 dtype 组合、tiling、torch 适配层
+的校验都只认 bf16 / fp16 / uint8）。
 
 ```bash
-python benchmarks/kernel/scatter_copy_ub_bench.py \
-    --ckv-dim 656 --kpe-dim 0 --dtype fp8 --rows 2048 --verify
-
-# 扫流水深度 / 合并行 / 行表开销
-python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --sweep bank
-python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --sweep group-rows
-python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 --sweep table-mode
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 --verify
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --sweep bank
+python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --sweep table-mode
 ```
 
-`--dtype uint8` 与 `--dtype fp8` 是**同一条 DMA 路径**（kernel 里 fp8 走 `uint8_t` 实例化，
-拷贝没有算术），差别只在 Python 侧怎么造数据；fp8 张量工厂不可用时用 `uint8` 即可。
+### 和 bf16 1152 B 行的差别
 
-### 这条路径和 bf16 版本的三个差别
-
-| 项 | bf16 1152B（512+64） | fp8 656B（单平面） |
+| 项 | bf16 1152 B（512+64） | 656 B 单平面 |
 |:---|:---|:---|
 | 每 token 的 DMA 次数 | 2（CKV + KPE） | 1 |
-| 行字节数 / 32B | 1024、128，都整除 | 656，**不整除**（656 = 20×32 + 16） |
-| UB 内行间距 | 等于行字节数 | 向上取整到 **672 B**，否则第 2 行的局部地址只有 16B 对齐，`DataCopyPad` 不接受 |
-| 能否 `--group-rows > 1` 合并 | 能（三种模式都行） | **不能**：合并要求 UB 内行间距能被 32B 整除；656 的倍数里只有偶数行数才对齐，行间距本身永远不行 —— 合并会退化成逐行 |
+| 行字节 / 32 B | 1024、128，都整除 | 656，**不整除**（656 = 20×32 + 16） |
+| UB 内行间距 | 等于行字节数 | 向上取整到 **672 B**，否则第 2 行的局部地址只有 16 B 对齐，`DataCopyPad` 不接受 |
+| 能否合并 | 三种模式都能 | 只能用 `GROUP_MODE_CONTIGUOUS`（整组在两侧都连续）：它从不单独寻址某一行，所以行字节不整除也无所谓；strided 模式不行（UB 里行距 672 B，无法用 32 B 单位表达） |
 
-归零的一点：`--group-rows` 在 656 上仍然会**跑**，只是内部落到逐行路径，数字应与
-`group-rows=1` 一致（差值是噪声）。所以 656 的调优空间只剩 `--bank`（流水深度）和
-`--table-mode`（行表标量读），**没有** bf16 那 +8.6% 的合并收益。
+### 实测：656 慢的不是数据量，是每次 DMA 的长度
 
-### 对照实验：672（补齐到 32B 整数倍）
+同一个 `--src host`、`rows 2048`、`bank 2`、`group 1`、`table 1` 下：
+
+| 行字节 | 实测 GB/s | 每行摊到时延 |
+|:---|:---|:---|
+| 512 | 41.3 | 12.4 ns |
+| 656 | 32.1 | 20.4 ns |
+| 672 | 32.1 | 20.9 ns |
+| 1024 | 44.3 | 23.1 ns |
+
+两个可以直接读出来的结论：
+
+1. **656 的每行代价（20.4 ns）几乎等于 1024 的（23.1 ns）**：只为搬 656 B，却付了接近 1024 B 的时间。
+   32.1 ≈ 656/1024 × 44.3 就是这么来的 —— 不是链路变窄，是每次 DMA 的有效载荷占比掉了。
+2. **672（= 21×32，行首 32 B 对齐）和 656 一样慢**，所以 **32 B 对齐不是原因**，上一版 README 里
+   「非 32 B 对齐会掉速」的猜测可以划掉：32 B 对齐只决定 `DataCopyPad` 收不收这个地址（由 `--verify`
+   判定），与吞吐无关。
+
+把 128 B、512 B、1024 B（快）和 656 B、672 B（慢）分开的唯一性质是：**长度是否为 128 B 的整数倍**。
+656 = 5.125×128、672 = 5.25×128，而 128 / 512 / 1024 都是整数倍。若这条规则成立，MTE 每次搬运会把
+长度按 128 B 向上取整，多出来的部分白付时间（656 → 768 B，理论上限 656/768 = 85%）。
+
+一条命令就能判：
 
 ```bash
-python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 672 --kpe-dim 0 --dtype fp8 --sweep group-rows
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 --kpe-dim 0 --dtype uint8 \
+    --src host --sweep ckv-dim
+# 384 / 512 / 640 / 768 / 896 / 1024 是 128 B 整数倍
+# 576 / 704 只是 64 B 整数倍
+# 656 / 672 是真实的 MLA 行
 ```
 
-672 = 21×32，合并路径全部可用。两个用途：
+- 若 384 / 512 / 640 / 768 / 896 / 1024 都在 40–45、而 576 / 704 掉到 30 出头 → 128 B 规则成立，
+  656 的损失是长度取整，只能靠「合并」或「补齐布局」绕开（见下）；
+- 若 576 / 704 也在 44 附近 → 规则不是 128 B，那就直接看合并能救回多少，不用纠结取整粒度。
 
-1. 如果生产端愿意把行补齐到 672 B（16B 对齐本来就要占位），那么 `--ckv-dim 672` 的
-   `group-rows=4` 读数就是这条路的**上限**；
-2. 作为**回归对照**：656 与 672 的 `group-rows=1` 读数应该非常接近（差 16/656 = 2.4%
-   的搬运量），如果 656 明显更慢或 `--verify` 报错，说明问题出在「非 32B 对齐行」本身，
-   而不是数据量。
+### 怎么把 656 提上去
+
+按性价比排序，前两条用现成开关就能测：
+
+1. **合并行**。k 行合成一次 DMA，长度 k×656，128 B 取整的浪费被摊薄：
+
+   | 合并行数 k | 一次 DMA 字节 | 128 B 取整后 | 有效占比 | 估计 GB/s |
+   |:---|:---|:---|:---|:---|
+   | 1 | 656 | 768 | 85% | 32.1（实测） |
+   | 2 | 1312 | 1408 | 93% | ~35 |
+   | 4 | 2624 | 2688 | 98% | 37–40 |
+   | 8 | 5248 | 5248 | 100% | 38–42 |
+
+   区间下限只算「取整浪费被摊薄」（32.1 × 有效占比 / 85%），上限再加上 bf16 上实测到的那部分
+   固定开销收益（`group-rows` 1 → 4 是 42.0 → 45.6，+8.6%）。两件事哪个占主导，靠下面的
+   `--sweep group-rows` 一次就能分开：如果 k=8 只到 38 上下，说明主因是每行固定开销而非取整。
+
+   `--table-mode 0` 让行号恒等、两侧天然连续，就是这条路的上限：
+   ```bash
+   python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 \
+       --table-mode 0 --src host --sweep group-rows
+   ```
+
+2. **真实 topk 局部性下值多少**。生产是随机 gather/scatter，能不能合并取决于命中的行是否相邻。
+   `--run-len` 把这件事变成实测，而不是假设：
+   ```bash
+   # 4 行连续的游程 + 合并 4 行 ≈ 理想局部性的上限
+   python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 \
+       --run-len 4 --src host --sweep group-rows
+
+   # 全随机置换：合并完全无效的底线
+   python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 \
+       --run-len 1 --src host --sweep group-rows
+   ```
+   两端都测出来，才知道生产上值不值得为 656 专门加一条合并路径。顺带：`--run-len k` 生成的行表
+   仍然是**唯一索引集合**（不同游程起点互不重叠），所以 `--verify` 依旧有效。
+
+3. **加深流水**（零成本，建议同时扫）。每行固定开销占比高时，`bank` 从 2 加到 4 / 6 可能直接吃回一块：
+   ```bash
+   python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype uint8 \
+       --src host --sweep bank
+   ```
+
+4. **改布局：行补到 768 B**（= 6×128，一次 DMA 就整除）。一次 768 B 搬运按 45 GB/s 算约 17 ns，
+   送 656 B 有效载荷 ≈ 38 GB/s，比 32.1 高约 19%；代价是 DRAM 里每行多 112 B（+17% 容量）。
+   能不能动取决于 cache 布局谁说了算，`--ckv-dim 768` 就是它的读数。
+
+5. **不要做的两件事**：用 strided 模式合并（UB 行距 672 B 表达不了）；把 656 拆成 512 + 144 两次 DMA
+   （两次都含非 128 B 整数倍的部分，比一次更慢）。
 
 ### 改了算子 ABI，两个产物都要重编
 
-这一版给 aclnn 增加了第 11 个参数 `copy_rope`，并给 def 增加了 fp8/uint8 的 dtype 组合，
+这一版给 aclnn 增加了第 11 个参数 `copy_rope`，并给 def 增加了 uint8 的 dtype 组合，
 所以**算子包和 torch 扩展必须一起重编**，只重编一个会报：
 
 - `no matching function for call to 'aclnnScatterCopyUbBenchGetWorkspaceSize'` → 算子包没重编；
@@ -323,20 +390,6 @@ SOC_VERSION=ascend950 VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \
     pip install -e . --no-build-isolation
 find . -name 'vllm_ascend_C*.so' -delete   # 若 .so 时间戳比源文件新，先删再装
 ```
-
-### 如果 656 的 `--verify` 失败
-
-`DataCopyPad` 在 GM 侧支持非 32B 对齐的长度，但**每次搬运的起始地址**是否也允许 16B 对齐，
-取决于 SoC/CANN 版本。这条路径的判据就是 `--verify`：
-
-```bash
-python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dtype fp8 \
-    --verify --verify-rows 0 --repeat-verify 20 --iters 1 --rounds 1
-```
-
-- 全过 → 656 单行 DMA 可用，直接看带宽；
-- 报 `torn or stale DMA` 且集中在奇偶行号上 → 起始地址对齐问题，生产端只能按 672 行布局
-  搬（或改成「偶数行合并成一次 1312B 搬运」，656×2 是 32B 整数倍）。
 
 ## host 侧带宽只有 42 GB/s：先分清是哪条链路
 
@@ -512,14 +565,16 @@ socket 的 DRAM 要么路由不通、要么不按地址位分口，靠页放置�
 |:---|:---|
 | 单卡下限 | 逐行 1152 B + 走行表：40.4 GB/s（≈400 Gbps 的 81%） |
 | 单卡上限 | 合并 4 行 + 恒等寻址：**45.6 GB/s（≈400 Gbps 的 91%）**，`--rows` 越大越接近 |
+| 656 B 单平面行（uint8） | 逐行 32.1 GB/s，只有 512 B 行的 78%：每次 DMA 付的是 ~1024 B 的时间，与 32B 对齐无关（详见上一节） |
 | 多卡 | 线性到 8 卡 322.4 GB/s，按 40 GB/s × 卡数 规划；无共享瓶颈，不需要特别绑定 |
 | 生产 kernel 的清单 | ①相邻 miss pair 合并读（+8.6%）②减少每行表标量读（+4%）③其余都是噪声 |
 
 ## 已知限制
 
-- 支持 BF16 / FP16 / FP8(e4m3fn) / UINT8。行字节数**不再要求** 32B 对齐：非 32B 整数倍的行
-  （如 fp8 656B）走逐行路径，UB 内每行按 32B 向上取整（656 → 672）落位；代价是这种情况下
-  `--group-rows > 1` 不能合并（合并要求 UB 内行间距能被 32B 整除）。
+- 支持 BF16 / FP16 / UINT8（1 字节 cache 行走 uint8，算子只搬字节，不需要 fp8 支持）。
+  行字节数**不要求** 32B 对齐：非 32B 整数倍的行（如 656B）在 UB 内按 32B 向上取整落位
+  （656 → 672）；这类行仍可 `--group-rows > 1` 合并，但只能用「整组连续」模式
+  （`GROUP_MODE_CONTIGUOUS`，两侧步长都为 1），strided 模式要求行距是 32B 整数倍。
 - `group-rows > 1` 只有在**源行连续**（`src_rows` 步长为 1）时才会合并读侧 DMA；
   写侧允许任意正向步长，与生产里 miss pair 的合并写一致。随机行表下会退化成逐行 DMA，
   这正是我们想看到的「合并能不能用」的结论。
