@@ -265,6 +265,11 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 饱和区（PCIe Gen5 x16 有效 ~42–52、400G 类口 ~45–47），但"单条"不等于"只用了一个口" ——
 如果每口是 200G 级（25 GB/s），42 也可能已经是两个口合计。所以顺序是先定性，再谈调优。
 
+> **结论先行（已在本仓库的 950 双 socket 节点上实测）**：
+> 40 GB/s 是**单张卡的 host 通路**上限。一个 socket 的口能同时喂两张卡各 40（实测 80.6），
+> 跨 socket 的两张卡也是 80.7。所以单卡再怎么改都到不了 80；要更多 host 带宽只能**多开卡**。
+> 推导过程见第 3 步的三行实测表，想看数据可直接跳到那里。
+
 **1) 先读拓扑：`CPU` 列告诉你 host 走什么，`Affinity` 列告诉你几个口**
 
 ```bash
@@ -344,13 +349,33 @@ python benchmarks/kernel/host_link_scale.py --procs 2 --devices 0,4 --rows 1024
 
 **实测（8 die / 4 NUMA node 的 950 节点，`node*/cpulist` = 0-95 / 96-191 / 192-287 / 288-383）**
 
-| 配置 | 带宽 |
-|:---|:---|
-| 单卡（NPU0，绑 node3） | 39.2 GB/s（`--cores 0` 时 40.3） |
-| NPU0（node3）+ NPU4（node1） | 78.4 GB/s（×2.00；`--cores 0` 时 80.7） |
+| 配置 | 带宽 | 倍数 |
+|:---|:---|:---|
+| 单卡（NPU0，绑 node3） | 40.3 GB/s（`--cores 20` 时 39.2） | 1.00× |
+| 跨组两卡（NPU0 + NPU4，node3 + node1） | 80.7 GB/s（`--cores 20` 时 78.4） | 2.00× |
+| **同组两卡（NPU0 + NPU1，都在 node3）** | **80.6 GB/s（1.99×）** | 2.00× |
 
-即：**两个 UB 口互不干扰，单卡速率就是单口速率**。要注意这台机器 4 个 NUMA node 只对应
-2 个 affinity 组（NPU0-3 → node3、NPU4-7 → node1），node0/node2 上没有挂 die。
+三行连起来读，结论是唯一确定的：
+
+1. 跨组 2× → 两个 socket 各有一条独立的 host 通路，能同时用满；
+2. **同组也 2× → 一个 socket 的口本身远不止 40 GB/s**（实测 ≥ 80.6），两张卡能从同一个口各取 40；
+3. 所以 40 GB/s 是**单张卡的 host 通路上限**，不是口的上限。
+
+推论：**单卡上再折腾（双源窗口、换地址区间、跨 socket 取页）都拿不到额外带宽** —— 卡自己的
+通路就 40，口还有余量却喂不进单卡。要更多主机带宽只有一条路：**多开卡**。
+
+要继续摸一个 socket 到底能给几张卡（也就是你们能开几个 rank 而不撞车）：
+
+```bash
+python benchmarks/kernel/host_link_scale.py --procs 4 --devices 0,1,2,3   # 单 socket 4 die
+python benchmarks/kernel/host_link_scale.py --procs 8 --devices 0,1,2,3,4,5,6,7
+```
+
+合计仍线性（4 die ≈ 161、8 die ≈ 322）就说明离口的上限还远；某个数量开始不线性，那个拐点
+才是这个 socket 的可用上限。
+
+注意这台机器 4 个 NUMA node 只对应 2 个 affinity 组（NPU0-3 → node3、NPU4-7 → node1），
+node0/node2 上没有挂 die。
 
 **4) 页跨 NUMA node 只在"同一张卡能看见两个 node"时才有意义**
 
@@ -362,11 +387,19 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --src host --host-interleave
 分配）。在 affinity 按 socket 分组的机器上实测**没有变化**，这是正常结果：单卡到另一个
 socket 的 DRAM 要么路由不通、要么不按地址位分口，靠页放置改不了端口选择。
 
-**5) 若要单卡用满两个口，方向是"跨 socket 的双注册窗口"**
+**5) 单卡双源窗口：实测已否掉，别做**
 
-只有第 3 步的同组对照显示"一个口能喂饱多张卡、但单卡就只有 40"时才值得做：给算子加第二个
-源指针，两段锁页内存分别注册（各自 `aclrtHostGetDevicePointer`），kernel 按 `row & 1` 或
-核号奇偶选基址。若同组对照仍是 1×，说明口本身封顶，这条路收益为 0，**别改**。
+原本的设想是给算子加第二个源指针、两段锁页内存分别注册，让读请求分到两个口。
+实测（见第 3 步）证明这条路没有收益：一个口能给两张卡各 40，而单卡无论读哪段地址都只有
+40 —— 天花板在卡自己的 host 通路上，不在口上，也不在地址分布上。**结论：不要改 kernel。**
+
+真要多拿 host 带宽，只有多开卡这一条路：
+
+| 需求 | 做法 |
+|:---|:---|
+| 单卡 | 最多 ~40 GB/s，`--bank`/`--group-rows` 只能优化「是否接近 40」，不能超过 |
+| 两个 socket 都用满 | 每个 socket 至少跑一张卡（两个 rank），合计 80+ |
+| 更多 | 同 socket 加卡继续线性，直到该口饱和（用第 3 步的 4 die / 8 die 扫描找拐点） |
 
 ## 已知限制
 
