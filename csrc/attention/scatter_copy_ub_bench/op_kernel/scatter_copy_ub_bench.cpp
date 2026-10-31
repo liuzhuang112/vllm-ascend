@@ -32,9 +32,11 @@
  * Differences from the production kernel (all of them are knobs here):
  *   - bank_num / group_rows / core_num are runtime parameters instead of
  *     compile-time constants, so one binary can sweep the whole space;
- *   - group_rows > 1 coalesces up to SCB_MAX_GROUP_ROWS rows whenever their
- *     source rows are contiguous; the write side picks between one contiguous
- *     descriptor and one strided descriptor (see GroupMode);
+ *   - group_rows > 1 coalesces up to SCB_MAX_GROUP_ROWS rows: a group is split
+ *     into runs of rows that are consecutive on both sides, and every run is one
+ *     descriptor per direction, so partial adjacency still pays off. When a whole
+ *     group qualifies, the write side picks between one contiguous descriptor and
+ *     one strided descriptor (see GroupMode);
  *   - table_mode == 0 skips the scalar GM reads of the row tables to expose the
  *     pure transfer ceiling, table_mode == 1 keeps the production-style
  *     `GlobalTensor::GetValue` address generation.
@@ -57,14 +59,21 @@ constexpr uint32_t SCB_MAX_GROUP_ROWS = 8;
  *
  * The distinction only matters when a row is not a multiple of 32 B: a 656 B
  * row cannot be placed at `r * 656` in UB, because DataCopyPad requires a 32 B
- * aligned LocalTensor. GROUP_MODE_ROWS therefore pads every row to the next
- * 32 B (656 -> 672) and copies row by row, while the two coalesced modes keep
- * the rows tight and never address one row individually, so they work for any
- * row length -- but they can only be used when the rows really are consecutive
- * on both sides.
+ * aligned LocalTensor. GROUP_MODE_ROWS therefore pads every run to the next
+ * 32 B (a single 656 B row -> 672) and moves one run per DMA, while the two
+ * coalesced modes keep the rows tight and never address one row individually,
+ * so they work for any row length -- but they can only be used when the rows
+ * really are consecutive on both sides.
+ *
+ * GROUP_MODE_ROWS is the default and is *not* one DMA per row: a 656 B 8-row
+ * group with rows 0..3 and 4..7 adjacent arrives as two runs of four, i.e. two
+ * DMAs of 2624 B rather than eight of 656 B. That is where nearly all of the
+ * 656 B row's headroom comes from -- the DMA is charged per 256 B granule, so
+ * 2624 B costs 11 granules for 4 rows (16.0 ns/row) against 3 granules plus a
+ * tail surcharge for one row (20.4 ns/row).
  */
 enum GroupMode : int64_t {
-    GROUP_MODE_ROWS = 0,        // one descriptor per row, UB rows padded to 32 B
+    GROUP_MODE_ROWS = 0,        // one descriptor per run of adjacent rows
     GROUP_MODE_CONTIGUOUS = 1,  // whole group is one tight copy in and out
     GROUP_MODE_STRIDED = 2,     // tight read, strided write (dst step > 1)
 };
@@ -201,6 +210,42 @@ private:
         }
         mode_[slot] = mode;
 
+        // Split the group into runs of rows that are consecutive on both sides,
+        // so the ROWS mode still merges whatever adjacency this group happens to
+        // have. The previous all-or-nothing test threw the whole group away as
+        // soon as one pair broke the run: with 4-row topk runs and group_rows=8
+        // it degraded to eight single-row DMAs and measured 31.7 GB/s against
+        // 40.7 at group_rows=4.
+        //
+        // Offsets are accumulated in UB element units and every run starts on a
+        // 32 B boundary, which is what DataCopyPad requires. Because
+        // align32(len * rowBytes) <= len * align32(rowBytes), the packed runs
+        // never exceed the per-row layout the tiling budgeted for; when every run
+        // holds one row the offsets coincide with the old `r * ubRowElems_`.
+        int64_t runCount = 0;
+        if (mode == GROUP_MODE_ROWS) {
+            int64_t runBegin = 0;
+            int64_t ubOffset = 0;
+            int64_t kpeUbOffset = 0;
+            while (runBegin < count && runCount < static_cast<int64_t>(SCB_MAX_GROUP_ROWS)) {
+                int64_t runEnd = runBegin + 1;
+                while (runEnd < count && srcTok[runEnd] == srcTok[runEnd - 1] + 1 &&
+                       dstTok_[slot][runEnd] == dstTok_[slot][runEnd - 1] + 1) {
+                    ++runEnd;
+                }
+                const int64_t len = runEnd - runBegin;
+                runStart_[slot][runCount] = runBegin;
+                runLen_[slot][runCount] = len;
+                runUb_[slot][runCount] = ubOffset;
+                runKpeUb_[slot][runCount] = kpeUbOffset;
+                ubOffset += AlignedSpanElems(len, ckvDim_);
+                kpeUbOffset += AlignedSpanElems(len, kpeDim_);
+                ++runCount;
+                runBegin = runEnd;
+            }
+        }
+        runCount_[slot] = runCount;
+
         // The queue type depends on the class template parameter BANK_COUNT, so
         // the member template has to be disambiguated with `template`.
         LocalTensor<T> local = copyQueue_.template AllocTensor<T>();
@@ -236,15 +281,20 @@ private:
                 DataCopyPad(local[kpeOffsetElems_], srcRopeGm_[srcTok[0] * kpeDim_], params, padParams);
             }
         } else {
-            for (int64_t r = 0; r < count; ++r) {
+            // One descriptor per run. len == 1 is the plain per-row case, so this
+            // loop also covers the fully scattered group.
+            for (int64_t j = 0; j < runCount; ++j) {
+                const int64_t len = runLen_[slot][j];
+                const int64_t runSrcTok = srcTok[runStart_[slot][j]];
                 params.blockCount = 1;
-                params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
+                params.blockLen = static_cast<uint32_t>(len * ckvDim_ * sizeof(T));
                 params.srcStride = 0;
-                DataCopyPad(local[r * ubRowElems_], srcKvGm_[srcTok[r] * ckvDim_], params, padParams);
+                params.dstStride = 0;
+                DataCopyPad(local[runUb_[slot][j]], srcKvGm_[runSrcTok * ckvDim_], params, padParams);
 
                 if (copyRope_) {
-                    params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
-                    DataCopyPad(local[kpeOffsetElems_ + r * kpeUbRowElems_], srcRopeGm_[srcTok[r] * kpeDim_],
+                    params.blockLen = static_cast<uint32_t>(len * kpeDim_ * sizeof(T));
+                    DataCopyPad(local[kpeOffsetElems_ + runKpeUb_[slot][j]], srcRopeGm_[runSrcTok * kpeDim_],
                                 params, padParams);
                 }
             }
@@ -288,15 +338,18 @@ private:
                 DataCopyPad(dstRopeGm_[dstTok_[slot][0] * kpeDim_], local[kpeOffsetElems_], params);
             }
         } else {
-            for (int64_t r = 0; r < count; ++r) {
+            for (int64_t j = 0; j < runCount_[slot]; ++j) {
+                const int64_t len = runLen_[slot][j];
+                const int64_t runDstTok = dstTok_[slot][runStart_[slot][j]];
                 params.blockCount = 1;
-                params.blockLen = static_cast<uint32_t>(ckvDim_ * sizeof(T));
+                params.blockLen = static_cast<uint32_t>(len * ckvDim_ * sizeof(T));
+                params.srcStride = 0;
                 params.dstStride = 0;
-                DataCopyPad(dstKvGm_[dstTok_[slot][r] * ckvDim_], local[r * ubRowElems_], params);
+                DataCopyPad(dstKvGm_[runDstTok * ckvDim_], local[runUb_[slot][j]], params);
 
                 if (copyRope_) {
-                    params.blockLen = static_cast<uint32_t>(kpeDim_ * sizeof(T));
-                    DataCopyPad(dstRopeGm_[dstTok_[slot][r] * kpeDim_], local[kpeOffsetElems_ + r * kpeUbRowElems_],
+                    params.blockLen = static_cast<uint32_t>(len * kpeDim_ * sizeof(T));
+                    DataCopyPad(dstRopeGm_[runDstTok * kpeDim_], local[kpeOffsetElems_ + runKpeUb_[slot][j]],
                                 params);
                 }
             }
@@ -307,6 +360,14 @@ private:
         // hand-fetched event id can collide with the one the queue reserves
         // for the same HardEvent.
         copyQueue_.FreeTensor(local);
+    }
+
+    // UB span of `rows` rows of `dim` elements, rounded up to the next 32 B unit:
+    // the following run has to start on a 32 B boundary, and the tiling budget
+    // was computed with exactly this rounding.
+    __aicore__ inline int64_t AlignedSpanElems(int64_t rows, int64_t dim) const
+    {
+        return AlignBytesToElems(rows * dim * static_cast<int64_t>(sizeof(T)));
     }
 
     // Both planes must consist of whole 32 B units for the strided copy-out:
@@ -362,6 +423,14 @@ private:
     int64_t dstTok_[SCB_MAX_BANKS][SCB_MAX_GROUP_ROWS];
     int64_t count_[SCB_MAX_BANKS];
     int64_t mode_[SCB_MAX_BANKS];
+    // Run decomposition of each in-flight group (ROWS mode): run j starts at
+    // dstTok_[slot][runStart_[slot][j]], is runLen_[slot][j] rows long, and lives
+    // at runUb_ / runKpeUb_ (element offsets, 32 B aligned) inside the bank.
+    int64_t runStart_[SCB_MAX_BANKS][SCB_MAX_GROUP_ROWS];
+    int64_t runLen_[SCB_MAX_BANKS][SCB_MAX_GROUP_ROWS];
+    int64_t runUb_[SCB_MAX_BANKS][SCB_MAX_GROUP_ROWS];
+    int64_t runKpeUb_[SCB_MAX_BANKS][SCB_MAX_GROUP_ROWS];
+    int64_t runCount_[SCB_MAX_BANKS];
 };
 }  // namespace
 

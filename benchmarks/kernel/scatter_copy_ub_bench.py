@@ -130,9 +130,9 @@ def _op_registered() -> bool:
 
 
 # --- what one row's DMA costs -------------------------------------------------
-# Fit to --sweep ckv-dim on A5 (host -> HBM, one DataCopyPad per row, 32 AIV):
+# Empirical model of one A5 part (host -> HBM, 32 AIV), fitted to two sweeps:
 #
-#     len B   ns/row   charged   ns per 256 B
+#   len B   ns/row   charged   ns per 256 B      (--sweep ckv-dim, 656 B rows)
 #     384      12.4      512         6.21
 #     512      12.4      512         6.21
 #     576      17.7      768         5.91
@@ -144,40 +144,74 @@ def _op_registered() -> bool:
 #     896      23.1     1024         5.77
 #    1024      23.1     1024         5.78
 #
-# Two things fall out of it: the transfer is charged in 256 B granules (384 and
-# 512 cost the same, 576/640/656/672/704/768 all cost the same), and a tail that
-# crosses the half-granule boundary (len % 256 > 128) adds ~2.7 ns. The fit is
-# within 4% on all ten points. It is an empirical model of one machine, not a
-# documented rule -- which is why the hint below is printed as a hint.
+#   and the same rows merged k at a time (--table-mode 0 --sweep group-rows):
+#
+#   group_rows=1  3 granules      20.1 ns/row   32.7 GB/s
+#   group_rows=2  6 granules      34.7 ns/DMA   37.8 GB/s   (17.4 ns/row)
+#   group_rows=4 11 granules      63.7 ns/DMA   41.2 GB/s   (15.9 ns/row)
+#   group_rows=8 21 granules     122.3 ns/DMA   42.9 GB/s   (15.3 ns/row)
+#
+# Least squares on all fourteen points:
+#
+#   t = 0.4 + 5.79 ns * ceil(len / 256) + 2.65 ns * (len % 256 > 128)
+#
+# mean |error| 1.5%. So the transfer is charged in 256 B granules at ~44.2 GB/s
+# per granule, plus a surcharge when the tail crosses the half granule. The
+# consequence for a 656 B row: one DMA per row pays 3 granules and the surcharge
+# (20.4 ns for 656 B = 32 GB/s), while four rows in one DMA pay 11 granules
+# (16.0 ns/row = 41 GB/s). It is an empirical model of one machine, not a
+# documented rule -- which is why it is only ever printed as a hint.
 DMA_GRANULE_BYTES = 256
-DMA_NS_PER_GRANULE = 6.0
-DMA_TAIL_SURCHARGE_NS = 2.7
+DMA_FIXED_NS = 0.41
+DMA_NS_PER_GRANULE = 5.79
+DMA_TAIL_SURCHARGE_NS = 2.65
 
 
-def dma_cost_hint(row_bytes: int) -> str:
-    """Explain what one row's DMA is charged for, and the cheapest padded row."""
-    units = -(-row_bytes // DMA_GRANULE_BYTES)
-    rem = row_bytes % DMA_GRANULE_BYTES
-    surcharge = DMA_TAIL_SURCHARGE_NS if rem > DMA_GRANULE_BYTES // 2 else 0.0
-    base_ns = units * DMA_NS_PER_GRANULE
-    ns = base_ns + surcharge
-    charged = units * DMA_GRANULE_BYTES
-    text = f"DMA: {row_bytes} B/row is charged as {charged} B ({units} x 256 B)"
-    if surcharge:
-        return (
-            f"{text}, and the {rem} B tail (> 128 B) adds ~{DMA_TAIL_SURCHARGE_NS:.1f} ns "
-            f"-> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful). Padding the row to "
-            f"{charged} B keeps the same payload in ~{base_ns:.1f} ns "
-            f"(~{row_bytes / base_ns:.0f} GB/s useful, {100 * (1 - base_ns / ns):.0f}% less "
-            f"time per row)"
-        )
+def dma_ns(nbytes: int) -> tuple[float, int, int]:
+    """(predicted ns, charged bytes, tail bytes) for one DMA of `nbytes`."""
+    units = -(-nbytes // DMA_GRANULE_BYTES) if nbytes > 0 else 0
+    tail = nbytes % DMA_GRANULE_BYTES
+    ns = DMA_FIXED_NS + units * DMA_NS_PER_GRANULE
+    if tail > DMA_GRANULE_BYTES // 2:
+        ns += DMA_TAIL_SURCHARGE_NS
+    return ns, units * DMA_GRANULE_BYTES, tail
+
+
+def predict_gbps(row_bytes: int, group_rows: int = 1) -> float:
+    """Model throughput of moving `group_rows` rows in one DMA."""
+    ns, _, _ = dma_ns(row_bytes * group_rows)
+    return float("inf") if ns <= 0 else row_bytes * group_rows / ns
+
+
+def merge_curve(row_bytes: int, ks: tuple[int, ...] = (1, 2, 3, 4, 6, 8)) -> str:
+    """The predicted GB/s of merging k rows, for k in `ks`."""
+    return " | ".join(f"k={k} {predict_gbps(row_bytes, k):.0f}" for k in ks)
+
+
+def dma_cost_hint(row_bytes: int, group_rows: int = 1) -> str:
+    """What one row's DMA is charged for, and what merging rows would buy."""
+    ns, charged, tail = dma_ns(row_bytes)
+    units = charged // DMA_GRANULE_BYTES
+    text = f"DMA: {row_bytes} B/row is charged as {charged} B ({units} x 256 B"
+    if tail > DMA_GRANULE_BYTES // 2:
+        text += f", and the {tail} B tail (> 128 B) adds ~{DMA_TAIL_SURCHARGE_NS:.1f} ns"
+    text += f") -> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful)"
     if charged > row_bytes:
-        return (
-            f"{text} -> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful). The remaining "
-            f"{charged - row_bytes} B of the granule are free: filling the row up to {charged} B "
-            f"costs no extra time"
-        )
-    return f"{text} -> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful)"
+        text += f"; the other {charged - row_bytes} B of the granule are free"
+    curve = merge_curve(row_bytes)
+    ceiling = DMA_GRANULE_BYTES / DMA_NS_PER_GRANULE  # B/ns == GB/s
+    lines = [
+        text,
+        f"     model t = {DMA_FIXED_NS:.1f} + {DMA_NS_PER_GRANULE:.2f} ns/granule + "
+        f"{DMA_TAIL_SURCHARGE_NS:.2f} ns if tail > 128 B; per-granule ceiling "
+        f"{ceiling:.1f} GB/s",
+        f"     merging rows (one DMA per group): {curve} GB/s"
+        + ("" if group_rows == 1 else f"  <- now running k={group_rows}, model says "
+                                      f"{predict_gbps(row_bytes, group_rows):.0f}"),
+        f"     where this row can go: {max(predict_gbps(row_bytes, k) for k in range(1, 9)):.0f} GB/s "
+        f"at k=8 (needs 8 adjacent rows on both sides)",
+    ]
+    return "\n".join(lines)
 
 
 def _custom_op_gate() -> str | None:
@@ -866,7 +900,7 @@ def main(argv=None) -> int:
         file=sys.stderr,
         flush=True,
     )
-    print(f"     {dma_cost_hint(row_bytes)}", file=sys.stderr, flush=True)
+    print(dma_cost_hint(row_bytes, base.group_rows), file=sys.stderr, flush=True)
 
     points: list[tuple[str, Case]] = []
     if args.sweep == "none":
