@@ -249,7 +249,8 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | `--table-mode` | `1` = 走行表 `GetValue`（同生产）；`0` = 恒等寻址 | 0 / 1 |
 | `--cores` | 启动的 AIV 数，`0` = 全部 | 8 / 16 / 24 / 48 |
 | `--src` | `npu` = 源在 HBM；`host` = 源在 host pinned 内存 | npu / host |
-| `--host-interleave` | 配合 `--src host`：以 `numactl --interleave=all` 重启，让源页跨 NUMA node（两个 host 口的场景） | 开关 |
+| `--device` | 跑在哪张卡上（默认 0）。测 host 带宽时两张卡分属不同 socket 才有意义 | 0 / 4 |
+| `--host-interleave` | 配合 `--src host`：以 `numactl --interleave=all` 重启，让源页跨 NUMA node（仅当同卡能看到两个 node 时有效） | 开关 |
 | `--json` | 每个 case 输出一行 JSON（供 `host_link_scale.py` 之类脚本汇总），不再打印表格 | 开关 |
 | `--verify-rows` | 校验多少行，`0` = 全部 | 64 / 0 |
 | `--repeat-verify` | 重复跑并重复校验的次数（抓偶发） | 20 |
@@ -264,19 +265,42 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 饱和区（PCIe Gen5 x16 有效 ~42–52、400G 类口 ~45–47），但"单条"不等于"只用了一个口" ——
 如果每口是 200G 级（25 GB/s），42 也可能已经是两个口合计。所以顺序是先定性，再谈调优。
 
-**1) 先确认 host 链路的类型，这一步决定后面所有结论**
+**1) 先读拓扑：`CPU` 列告诉你 host 走什么，`Affinity` 列告诉你几个口**
 
 ```bash
-lspci -tv                              # 加速卡挂在哪个 switch/root port
-lspci -s <卡的 BDF> -vv | grep -i lnksta   # 宽度与速率，例如 Width x16, Speed 32GT/s
-npu-smi info -t topo                  # 厂商视角的 host/device 连接方式（PCIe / UB）
-lscpu | grep -i numa ; cat /sys/devices/system/node/online
+python benchmarks/kernel/npu_topology.py            # 解析 + 汇总
+python benchmarks/kernel/npu_topology.py --dump     # 连同 npu-smi 原始表
 ```
 
-- 若 host 侧是 **PCIe Gen5 x16**：42 GB/s 已经接近这条链路做 DMA 的实际上限（理论 63，
-  实际拷贝通常 42–52），此时"第二个口"多指芯片内部 die 之间的 UB，host 侧没有可再开的
-  通路，改 kernel 也拿不到额外带宽。
-- 若 host 侧确实是 **UB** 且有两个口：继续第 2 步。
+典型 8 die 双 socket 节点的输出：
+
+```
+ die  cpu link       affinity  numa node  host port
+   0        UB        288-383          0  #0
+   1        UB        288-383          0  #0
+   2        UB        288-383          0  #0
+   3        UB        288-383          0  #0
+   4        UB         96-191          1  #1
+   5        UB         96-191          1  #1
+   6        UB         96-191          1  #1
+   7        UB         96-191          1  #1
+
+2 affinity groups -> the node most likely has 2 host ports, one per group:
+  port #0: dies [0, 1, 2, 3] (affinity 288-383, numa node 0)
+  port #1: dies [4, 5, 6, 7] (affinity 96-191, numa node 1)
+```
+
+判读规则：
+
+| 拓扑现象 | 含义 |
+|:---|:---|
+| `CPU` 列为 `PCIe`，且 `lspci -vv` 显示 `Width x16, Speed 32GT/s` | 单条 PCIe Gen5 x16，42 GB/s 就是上限，没有第二个口可开 |
+| `CPU` 列为 `UB`，`Affinity` 只有一组 | host 侧只有一条 UB 通路，die 再多也共用它 |
+| `CPU` 列为 `UB`，`Affinity` 分成两组（如 288-383 / 96-191） | **两个 socket，各带一个 host 口**，每组 4 个 die 只能走自己那口 |
+
+第三行就是"2 个 UB 口"的实际情况：口是**按 socket 划分**的，不是同一张卡上有两个口。
+一个进程绑在一张卡上，最多只能用到这张卡所属 socket 的那一个口 —— 所以单卡 42 GB/s
+不是 kernel 没写满，而是物理上只连了一条路。
 
 **2) 端口计数器只在链路以"端口设备"形式暴露时才有意义**
 
@@ -294,41 +318,43 @@ rx/tx 增量与 GB/s。
 通，直接跳到第 3 步。只有出现 `hccn*` 行（或多块网卡有 GB 级增量）时，"几行为非零 = 几个口"
 才成立。
 
-**3) 不依赖计数器的决定性实验：看带宽能不能叠加**
+**3) 不依赖计数器的决定性实验：两张卡同时跑，看带宽能不能叠加**
+
+拓扑已经说明口是按 socket 分的，所以要两个口一起动，就必须让**两个 socket 上的卡同时跑**
+（`--device` 选择卡号，默认 0）：
 
 ```bash
-python benchmarks/kernel/host_link_scale.py --procs 2 --rows 1024 --iters 2000 --cores 20
+python benchmarks/kernel/host_link_scale.py --procs 2 --devices 0,4 --cores 20 --rows 1024
 ```
 
-脚本先单进程测一次，再并发 N 个进程（有 numactl 时各自绑一个 NUMA node），比较总和：
+脚本会：打印拓扑摘要 → 自动把 NPU0 绑到 node 0、NPU4 绑到 node 1（`numactl
+--cpunodebind/--membind`）→ 先单进程测基线 → 再并发两个进程 → 给判定。不给 `--devices`
+时按"每个 affinity 组取一个代表 die"自动选，正好是一组一个口。
 
-| 结果 | 结论 |
-|:---|:---|
-| 合计 ≈ N × 单进程 | host 通路**可叠加**，单实例吃不满：值得做双窗口/kernel 侧拆分 |
-| 合计 ≈ 单进程 | 通路或共用适配器已饱和，并行与改 kernel 都拿不到带宽 |
+| 结果 | 结论 | 下一步 |
+|:---|:---|:---|
+| 合计 ≈ 2 × 42 | 两个口独立可用，单卡吃不满是因为只连了一条 | 要带宽就让两个 socket 各跑一张卡；单卡 kernel 怎么改都到不了 84 |
+| 合计 ≈ 42 | 两个进程抢的是同一个口或同一套适配器 | 改 kernel、加窗口都无意义 |
 
 `--cores` 必须给（例如 40 核设备各给 20），否则先启动的内核占满 AIV，后一个只是在排队，
 测出来的"不叠加"是假象。
 
-**4) 页跨 NUMA node（只在第 1 步显示多 NUMA 时才有意义）**
+**4) 页跨 NUMA node 只在"同一张卡能看见两个 node"时才有意义**
 
 ```bash
 python benchmarks/kernel/scatter_copy_ub_bench.py --src host --host-interleave
 ```
 
 `--host-interleave` 在分配源之前用 `numactl --interleave=all` 重启自己（mempolicy 必须早于
-分配）。实测在单 NUMA 或路由不按页放置的机器上**没有变化**，这是正常结果：它只能解决
-"页全在一个 node 上"这一种成因，不能改变端口选择逻辑。
+分配）。在 affinity 按 socket 分组的机器上实测**没有变化**，这是正常结果：单卡到另一个
+socket 的 DRAM 要么路由不通、要么不按地址位分口，靠页放置改不了端口选择。
 
-**5) 真要到改 kernel 时，方向是"两个注册窗口"**
+**5) 若要单卡用满两个口，方向是"跨 socket 的双注册窗口"**
 
-现在的 `--src host` 只有**一个**源指针，所有行都从同一段 host 区间读；即使页跨 node，
-地址位落在一个连续区间里仍可能被路由到同一个口。要稳定用满两条，最小改动是给算子加第二个
-源指针：分配两段锁页内存、分别注册（各自 `aclrtHostGetDevicePointer`），kernel 按
-`row_bit = row & 1`（或按核号奇偶）选基址。这样每核的读请求天然分到两段地址区间，
-不依赖分配器的页放置策略。
-
-前提是第 3 步的合计能超过单进程；否则这层改动只会增加复杂度。
+只有第 3 步显示"同卡双窗口可行"（例如两台卡各跑时合计 ~84，而单卡内两段源地址也能分别
+命中两个口）时才值得做：给算子加第二个源指针，两段锁页内存分别注册
+（各自 `aclrtHostGetDevicePointer`），kernel 按 `row & 1` 或核号奇偶选基址。若第 3 步的
+结果说明口是按卡分的，这条路的收益就是 0，**别改**。
 
 ## 已知限制
 

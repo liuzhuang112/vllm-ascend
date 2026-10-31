@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """Does host bandwidth add up when several runs overlap?
 
-Port counters answer "which link carried traffic" only if the link is visible as
-a device with counters. On a 950 whose DRAM is behind UB ports it often is not,
-so this script answers the question a different way: measure one process, then
-measure N processes started at the same time and compare the totals.
+Port counters answer "which link carried traffic" only if the link shows up as a
+device with counters. On a 950 whose DRAM sits behind UB ports it usually does
+not, so this script answers the question a different way: measure one process,
+then measure N processes started at the same time and compare the totals.
 
     python benchmarks/kernel/host_link_scale.py --procs 2 --rows 1024 --iters 2000
+
+On a two-socket node the eight dies are split into two affinity groups and each
+socket owns one host port (see ``npu_topology.py``). One process on one die can
+therefore only reach one port, so the useful test puts a process on a die from
+*each* group, bound to the NUMA node of its affinity range:
+
+    python benchmarks/kernel/host_link_scale.py --procs 2 --devices 0,4 --cores 20
 
 Read the verdict at the end:
 
     sum ~= N x single   the host path scales, so a single run cannot reach the
-                        ceiling; spreading the work over several engines (or two
+                        ceiling; spreading the work over several dies (or two
                         registered windows inside one kernel) buys bandwidth
     sum ~= single       the host path or the shared adapter is already saturated
                         at one instance, and no amount of parallelism helps
@@ -19,9 +26,6 @@ Read the verdict at the end:
 AIV cores are the other way to accidentally serialize the launches: a kernel that
 asks for every core leaves none for the second process. Pass ``--cores`` to split
 them (e.g. 20 each on a 40-core device) when you want real overlap.
-
-``numactl`` is used to pin each process to a different NUMA node when available,
-because one port per node is the usual layout; ``--bind none`` disables it.
 """
 
 from __future__ import annotations
@@ -33,34 +37,19 @@ import shutil
 import subprocess
 import sys
 
+import npu_topology
+
 BENCH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scatter_copy_ub_bench.py")
 
 
-def numa_nodes() -> list[int]:
-    try:
-        with open("/sys/devices/system/node/online") as handle:
-            raw = handle.read().strip()
-    except OSError:
-        return []
-    nodes: list[int] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            lo, hi = part.split("-", 1)
-            nodes.extend(range(int(lo), int(hi) + 1))
-        else:
-            nodes.append(int(part))
-    return nodes
-
-
-def bench_cmd(args, rows: int) -> list[str]:
+def bench_cmd(args, rows: int, device: int) -> list[str]:
     cmd = [
         sys.executable,
         args.bench,
         "--src",
         "host",
+        "--device",
+        str(device),
         "--rows",
         str(rows),
         "--iters",
@@ -125,6 +114,32 @@ def run_concurrent(cmds: list[list[str]], nodes: list[int | None]) -> list[float
     return results
 
 
+def parse_devices(text: str) -> list[int]:
+    devices = [int(part) for part in text.replace(" ", ",").split(",") if part.strip()]
+    if not devices:
+        raise ValueError("empty --devices")
+    return devices
+
+
+def choose_devices(args, topo: list[dict]) -> list[int]:
+    """One die per affinity group, because one group == one host port."""
+    if args.devices:
+        return parse_devices(args.devices)
+    clusters = npu_topology.groups(topo)
+    if not clusters:
+        return list(range(args.procs))
+    # One representative die from each cluster, in cluster order, then cycle.
+    representatives = [min(cluster["devices"]) for cluster in clusters]
+    devices = [representatives[i % len(representatives)] for i in range(args.procs)]
+    if args.procs > len(representatives):
+        print(
+            f"note: only {len(representatives)} affinity group(s) but {args.procs} "
+            "process(es); some processes will share a host port",
+            file=sys.stderr,
+        )
+    return devices
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -135,6 +150,12 @@ def main(argv=None) -> int:
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument(
+        "--devices",
+        default="",
+        help="comma-separated NPU indices, one per process (default: one die per affinity "
+        "group, which is one die per host port)",
+    )
+    parser.add_argument(
         "--cores",
         type=int,
         default=0,
@@ -143,9 +164,10 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--bind",
-        choices=("auto", "none"),
+        choices=("auto", "topo", "none"),
         default="auto",
-        help="auto = one NUMA node per process through numactl (default)",
+        help="auto/topo = pin each process to the NUMA node of its die's affinity range "
+        "(default); none = no numactl",
     )
     parser.add_argument("--bench", default=BENCH, help="benchmark script to drive")
     args = parser.parse_args(argv)
@@ -160,17 +182,37 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
 
-    nodes = numa_nodes() if args.bind == "auto" else []
-    if args.bind == "auto" and len(nodes) < args.procs:
-        print(
-            f"note: {len(nodes)} NUMA node(s) visible for {args.procs} process(es); "
-            "binding only where possible",
-            file=sys.stderr,
-        )
+    topo_text = npu_topology.read_topo() if args.bind != "none" else None
+    topo = npu_topology.parse_topo(topo_text) if topo_text else []
+    if topo:
+        print(npu_topology.summary(topo))
+        print()
 
-    total_rows = args.rows * args.procs
-    print(f"single: 1 process x {args.rows} rows")
-    single = run_sequential(bench_cmd(args, args.rows), nodes[0] if nodes else None)
+    devices = choose_devices(args, topo)
+    node_of_device: dict[int, int | None] = {}
+    for row in topo:
+        node_of_device[row["device"]] = npu_topology.node_of(row["cpus"])
+    if args.bind == "none":
+        nodes: list[int | None] = [None] * len(devices)
+    else:
+        nodes = [node_of_device.get(device) for device in devices]
+        if topo and all(node is None for node in nodes):
+            print(
+                "note: the topo affinity ranges do not map onto a visible NUMA node "
+                "(single node?) so binding cannot steer a die to a second host port",
+                file=sys.stderr,
+            )
+        elif not topo:
+            print(
+                "note: npu-smi topo unavailable, so processes are not bound to the NUMA "
+                "node of their die; results may all land on one host port",
+                file=sys.stderr,
+            )
+
+    single_node = nodes[0] if nodes else None
+    print(f"single: 1 process x {args.rows} rows on NPU{devices[0]}"
+          f"{'' if single_node is None else f' (numa node {single_node})'}")
+    single = run_sequential(bench_cmd(args, args.rows, devices[0]), single_node)
     if single is None:
         print("baseline run failed; nothing to compare", file=sys.stderr)
         return 1
@@ -178,22 +220,22 @@ def main(argv=None) -> int:
 
     # Keep the total payload comparable to the baseline so the per-run fixed costs
     # do not flatter the concurrent case.
+    total_rows = args.rows * args.procs
     per_proc_rows = total_rows // args.procs
     print(f"\nconcurrent: {args.procs} processes x {per_proc_rows} rows")
-    cmds = [bench_cmd(args, per_proc_rows) for _ in range(args.procs)]
-    bindings: list[int | None] = [nodes[i % len(nodes)] if nodes else None for i in range(args.procs)]
-    results = run_concurrent(cmds, bindings)
+    cmds = [bench_cmd(args, per_proc_rows, device) for device in devices]
+    results = run_concurrent(cmds, nodes)
     if any(r is None for r in results):
         print("at least one concurrent run failed", file=sys.stderr)
         return 1
 
-    print(f"{'proc':>5} {'node':>5} {'GB/s':>8}")
-    print("-" * 20)
-    for index, (value, node) in enumerate(zip(results, bindings)):
-        print(f"{index:>5} {('-' if node is None else node):>5} {value:>8.1f}")
+    print(f"{'proc':>5} {'npu':>4} {'node':>5} {'GB/s':>8}")
+    print("-" * 26)
+    for index, (value, device, node) in enumerate(zip(results, devices, nodes)):
+        print(f"{index:>5} {device:>4} {('-' if node is None else node):>5} {value:>8.1f}")
     total = sum(r for r in results if r is not None)
-    print("-" * 20)
-    print(f"{'sum':>5} {'':>5} {total:>8.1f}   (single run: {single:.1f} GB/s, x{total / single:.2f})")
+    print("-" * 26)
+    print(f"{'sum':>5} {'':>4} {'':>5} {total:>8.1f}   (single run: {single:.1f} GB/s, x{total / single:.2f})")
     print()
     if total >= single * 1.5:
         print(
@@ -201,11 +243,17 @@ def main(argv=None) -> int:
             "concurrent engines (or two registered source windows inside one kernel) "
             "can use the bandwidth that is idle today."
         )
+        print(
+            "  next: if the two processes sit on two different dies, a single-die kernel "
+            "cannot follow -- the win has to come from running more dies, not from "
+            "restructuring one kernel's copy."
+        )
     else:
         print(
             "verdict: the host path does NOT scale past one instance. Either it is "
-            "already saturated (single link / shared host adapter / a PCIe slot at "
-            "line rate) or the extra processes never overlapped (check --cores)."
+            "already saturated (single link / shared host adapter) or the extra "
+            "processes never overlapped (check --cores and that the two processes "
+            "landed on dies from different affinity groups)."
         )
     return 0
 

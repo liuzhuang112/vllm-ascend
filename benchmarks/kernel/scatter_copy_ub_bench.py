@@ -310,6 +310,7 @@ class Case:
     cores: int
     dtype: torch.dtype
     src: str
+    device: int = 0
 
 
 class Bench:
@@ -317,7 +318,12 @@ class Bench:
 
     def __init__(self, case: Case, seed: int = 0) -> None:
         self.case = case
-        self.device = torch.device("npu:0")
+        # Which die to run on matters for host bandwidth: on a 950 node the eight
+        # dies are split across two sockets (see ``npu-smi info -t topo``), and
+        # each socket attaches host DRAM through its own UB port. One process on
+        # one die therefore touches one port at most.
+        torch.npu.set_device(case.device)
+        self.device = torch.device(f"npu:{case.device}")
         self._host_regions: list[tuple[int, int, torch.Tensor]] = []
         gen = torch.Generator().manual_seed(seed)
         rows = case.rows
@@ -575,6 +581,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--cores", type=int, default=0, help="AIV blocks to launch, 0 = all")
     parser.add_argument("--src", choices=("npu", "host"), default="npu", help="source placement")
     parser.add_argument(
+        "--device",
+        type=int,
+        default=0,
+        help="NPU index to run on (default: 0). Use different indices per process when "
+        "measuring how many host links a node has: topo groups them by socket",
+    )
+    parser.add_argument(
         "--host-interleave",
         action="store_true",
         help="with --src host, restart under numactl --interleave=all so the source pages "
@@ -640,6 +653,7 @@ def main(argv=None) -> int:
         cores=args.cores,
         dtype=dtype,
         src=args.src,
+        device=args.device,
     )
 
     points: list[tuple[str, Case]] = []
@@ -669,6 +683,7 @@ def main(argv=None) -> int:
                         {
                             "label": label,
                             "src": case.src,
+                            "device": case.device,
                             "rows": case.rows,
                             "group_rows": case.group_rows,
                             "bank": case.bank,
