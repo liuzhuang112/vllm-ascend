@@ -47,6 +47,10 @@ Examples:
     # DRAM (host pinned) -> HBM
     python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 --src host
 
+    # pick the card: which die you land on decides which host link is used
+    python benchmarks/kernel/scatter_copy_ub_bench.py --list-devices
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 --src host --device 3
+
 Two separate products must exist before the first run, from the repository
 root::
 
@@ -114,6 +118,9 @@ PINNED_REGISTER_OPT = "pinned_mem_register:True"
 _alloc_conf_added = False
 # Set by the re-exec below so the restarted process does not restart again.
 INTERLEAVE_ENV = "SCATTER_COPY_UB_INTERLEAVED"
+# CANN's own card filter. It is read before torch_npu initialises and renumbers
+# the cards, which is why --device cannot validate against physical ids.
+DEVICE_ENV = "ASCEND_RT_VISIBLE_DEVICES"
 REBUILD_BINDING = (
     "  build the torch binding; the kernel package alone does not register it:\n"
     "    SOC_VERSION=<soc> VLLM_ASCEND_CUSTOM_OPS=scatter_copy_ub_bench \\\n"
@@ -376,6 +383,95 @@ def _load_runtime():
     _warn_if_kernel_package_missing()
 
 
+def _parse_device(text: str) -> int:
+    """``3`` and ``npu:3`` both mean "the fourth visible NPU"."""
+    value = text.strip().lower()
+    if value.startswith("npu:"):
+        value = value[len("npu:") :]
+    try:
+        index = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an NPU index such as 0 or npu:0, got {text!r}") from exc
+    if index < 0:
+        raise argparse.ArgumentTypeError(f"NPU index must be >= 0, got {index}")
+    return index
+
+
+def _device_name(index: int) -> str:
+    try:
+        return torch.npu.get_device_name(index)
+    except Exception:  # noqa: BLE001 - a diagnostic must not fail the run
+        return "name unavailable"
+
+
+def _physical_ids(count: int) -> list[str]:
+    """The physical card ids behind ``--device``, when the filter tells us.
+
+    ``ASCEND_RT_VISIBLE_DEVICES=2,5`` makes this process see two cards, numbered
+    0 and 1. Reading the variable back is the only way to name the real ids: the
+    runtime does not expose the mapping.
+    """
+    entries = [part.strip() for part in os.environ.get(DEVICE_ENV, "").split(",") if part.strip()]
+    return entries if len(entries) == count else []
+
+
+def _list_devices() -> int:
+    """Print the cards this process can see, as ``--device`` numbers them."""
+    count = torch.npu.device_count()
+    mapped = os.environ.get(DEVICE_ENV, "").strip()
+    if count <= 0:
+        print("no NPU is visible to this process", file=sys.stderr)
+        return 1
+    print(f"{count} NPU(s) visible" + (f" via {DEVICE_ENV}={mapped}" if mapped else ""))
+    physical = _physical_ids(count)
+    print(f"{'--device':>8}  {'name':<28}" + ("  physical" if physical else ""))
+    for index in range(count):
+        suffix = f"  {physical[index]:>8}" if physical else ""
+        print(f"{index:>8}  {_device_name(index):<28}{suffix}")
+    if mapped:
+        print(
+            f"\n{DEVICE_ENV} renumbers the cards, so --device N is the N-th entry "
+            f"of that list, not a physical card id.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _select_device(index: int) -> int:
+    """Make ``index`` the current card, and say which card that turned out to be.
+
+    Every tensor in this benchmark is allocated on the current device and the
+    op launches on it, so this single call is what decides the die -- and on a
+    950 the die decides which UB port reaches host DRAM.
+    """
+    count = torch.npu.device_count()
+    if count <= 0:
+        raise SystemExit(
+            "no NPU is visible to this process; check `npu-smi info` and "
+            f"{DEVICE_ENV} (a bad filter hides every card)."
+        )
+    if index < 0:
+        raise SystemExit(f"--device must be >= 0, got {index}")
+    if index >= count:
+        mapped = os.environ.get(DEVICE_ENV, "").strip()
+        where = f"{DEVICE_ENV}={mapped} renumbers them. " if mapped else ""
+        raise SystemExit(
+            f"--device {index} is out of range: only {count} NPU(s) are visible "
+            f"(valid: 0..{count - 1}). {where}Run --list-devices to see the mapping."
+        )
+    torch.npu.set_device(index)
+    physical = _physical_ids(count)
+    where = f", physical {physical[index]}" if physical else ""
+    mapped = os.environ.get(DEVICE_ENV, "").strip()
+    print(
+        f"device: npu{index} ({_device_name(index)}){where}, {count} visible"
+        + (f", {DEVICE_ENV}={mapped}" if mapped else ""),
+        file=sys.stderr,
+        flush=True,
+    )
+    return index
+
+
 @cache
 def _acl_runtime() -> ctypes.CDLL:
     """The CANN entry points that publish host memory to the device."""
@@ -492,7 +588,8 @@ class Bench:
         # Which die to run on matters for host bandwidth: on a 950 node the eight
         # dies are split across two sockets (see ``npu-smi info -t topo``), and
         # each socket attaches host DRAM through its own UB port. One process on
-        # one die therefore touches one port at most.
+        # one die therefore touches one port at most. main() has already called
+        # _select_device(), so this only matters when Bench is used directly.
         torch.npu.set_device(case.device)
         self.device = torch.device(f"npu:{case.device}")
         self._host_regions: list[tuple[int, int, torch.Tensor]] = []
@@ -802,10 +899,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--src", choices=("npu", "host"), default="npu", help="source placement")
     parser.add_argument(
         "--device",
-        type=int,
+        type=_parse_device,
         default=0,
-        help="NPU index to run on (default: 0). Use different indices per process when "
-        "measuring how many host links a node has: topo groups them by socket",
+        metavar="N",
+        help="NPU index to run on, as `3` or `npu:3` (default: 0). Indices are into the "
+        f"visible set, so {DEVICE_ENV}=5 makes --device 0 mean card 5. Use different "
+        "indices per process when measuring how many host links a node has: topo "
+        "groups them by socket. --list-devices prints the mapping",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="print the visible NPUs with the index --device expects, then exit",
     )
     parser.add_argument(
         "--host-interleave",
@@ -874,6 +979,11 @@ def main(argv=None) -> int:
             print("note: --host-interleave only affects --src host", file=sys.stderr)
         _reexec_interleaved(sys.argv[1:])
     _load_runtime()
+    if args.list_devices:
+        return _list_devices()
+    # Bind the card before anything is allocated: every tensor below is created
+    # on the current device, so this is the only place the die is chosen.
+    _select_device(args.device)
     dtype = DTYPES[args.dtype][0]
     if args.kpe_dim < 0 or args.ckv_dim <= 0:
         raise SystemExit("--ckv-dim must be > 0 and --kpe-dim must be >= 0")

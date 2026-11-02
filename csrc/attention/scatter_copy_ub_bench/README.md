@@ -215,6 +215,54 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dt
 
 `GB/s = rows × B/row / 时延`，即只统计有效载荷（读一份 + 写一份的实际带宽约为此值的 2 倍）。
 
+## 选卡：`--device` 与 `ASCEND_RT_VISIBLE_DEVICES`
+
+```bash
+# 先看这个进程能摸到哪几张卡（顺序就是 --device 的取值）
+python benchmarks/kernel/scatter_copy_ub_bench.py --list-devices
+#   8 NPU(s) visible
+#   --device  name                          physical
+#          0  Ascend910_93xxx                       0
+#          1  Ascend910_93xxx                       1
+#   ...
+
+# 跑第 4 张卡（0 基），`3` 和 `npu:3` 等价
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 --src host --device 3
+# stderr 第一行会回显实际选中的卡，日志里直接可查：
+#   device: npu3 (Ascend910_93xxx), 8 visible
+```
+
+设了 `ASCEND_RT_VISIBLE_DEVICES` 时，`--list-devices` 会多一列 `physical`，把序号和物理卡号对上：
+
+```text
+2 NPU(s) visible via ASCEND_RT_VISIBLE_DEVICES=2,5
+--device  name                          physical
+       0  Ascend910_93xxx                       2
+       1  Ascend910_93xxx                       5
+```
+
+两条规则：
+
+1. **`--device N` 是"可见卡列表"里的序号，不是物理卡号。** 设了
+   `ASCEND_RT_VISIBLE_DEVICES=2,5` 时，`--device 0` 指的是物理 2 号卡，`--device 1` 是物理 5 号卡；
+   超出可见数量会直接报错并提示去看 `--list-devices`，不会静默跑错卡。
+2. **`ASCEND_RT_VISIBLE_DEVICES` 必须在 `python` 启动前 export**（CANN 在初始化时装它的过滤器），
+   而 `--device` 是进程内的 `torch.npu.set_device()`，在第一次分配之前调用一次。所以：
+   - 只想换一张卡 → 用 `--device N`；
+   - 想让进程**根本看不到**别的卡（避免别人占卡、或想固定编号）→
+     `ASCEND_RT_VISIBLE_DEVICES=N python benchmarks/kernel/scatter_copy_ub_bench.py ...`。
+
+为什么这件事在 host 带宽测试里不是小事：950 的 8 个 die 分属两个 socket，**每张卡只经由自己那个
+UB 口访问 host DRAM**（见下文拓扑一节）。所以换卡就等于换一条链路，单卡读数会随卡号变（实测
+40.4 vs 39.2 这类差别就来自 affinity 与 NUMA 绑定），多进程想叠出 2× 也必须挑**不同组**的卡：
+
+```bash
+# 两个进程各占一张卡（不同 socket），并发才能看到两条链路
+python benchmarks/kernel/host_link_scale.py --procs 2 --devices 0,4 --rows 1024
+```
+
+`--device` 只影响本进程；`host_link_scale.py` 会把 `--devices` 里的每个号分别传给子进程的 `--device`。
+
 ## 校验（`--verify`）
 
 ```bash
@@ -256,7 +304,8 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | `--table-mode` | `1` = 走行表 `GetValue`（同生产）；`0` = 恒等寻址 | 0 / 1 |
 | `--cores` | 启动的 AIV 数，`0` = 全部 | 8 / 16 / 24 / 48 |
 | `--src` | `npu` = 源在 HBM；`host` = 源在 host pinned 内存 | npu / host |
-| `--device` | 跑在哪张卡上（默认 0）。测 host 带宽时两张卡分属不同 socket 才有意义 | 0 / 4 |
+| `--device` | 跑在哪张卡上（默认 0），写 `3` 或 `npu:3` 都行；**索引是"可见卡列表"里的序号**，不是物理卡号。测 host 带宽时两张卡分属不同 socket 才有意义 | 0 / 4 |
+| `--list-devices` | 打印本进程能看到的卡、`--device` 序号与卡名的对应关系，然后退出 | 开关 |
 | `--host-interleave` | 配合 `--src host`：以 `numactl --interleave=all` 重启，让源页跨 NUMA node（仅当同卡能看到两个 node 时有效） | 开关 |
 | `--json` | 每个 case 输出一行 JSON（供 `host_link_scale.py` 之类脚本汇总），不再打印表格 | 开关 |
 | `--verify-rows` | 校验多少行，`0` = 全部 | 64 / 0 |
