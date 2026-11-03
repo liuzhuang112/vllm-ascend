@@ -51,6 +51,11 @@ Examples:
     python benchmarks/kernel/scatter_copy_ub_bench.py --list-devices
     python benchmarks/kernel/scatter_copy_ub_bench.py --rows 2048 --src host --device 3
 
+    # real cache shape: 131072 rows in DDR, only 4096 of them copied per launch
+    # --rotate keeps the page tables cold, i.e. different rows every launch
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --src-rows 131072 \
+        --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --rotate 16
+
 Two separate products must exist before the first run, from the repository
 root::
 
@@ -565,6 +570,19 @@ class Case:
     ckv_dim: int = CKV_DIM
     kpe_dim: int = KPE_DIM
     run_len: int = 1
+    # Rows allocated in the source (the gather pool). 0 means "same as rows",
+    # i.e. every allocated row is copied once. A larger pool is the real shape
+    # of a KV cache: 131072 rows in DRAM, 4096 of them picked by topk, so the
+    # copy walks a working set 32x bigger than the payload it moves.
+    pool_rows: int = 0
+    # Distinct source tables to rotate through, one per launch (0/1 = reuse the
+    # same 4096 rows every launch, which keeps the page tables warm).
+    rotate: int = 0
+
+    @property
+    def src_total(self) -> int:
+        """Rows in the source tensor (never smaller than the copy count)."""
+        return self.pool_rows if self.pool_rows > 0 else self.rows
 
     @property
     def copy_rope(self) -> bool:
@@ -595,19 +613,33 @@ class Bench:
         self._host_regions: list[tuple[int, int, torch.Tensor]] = []
         gen = torch.Generator().manual_seed(seed)
         rows = case.rows
+        pool = case.src_total
 
         # Sparse topk selection is a random gather from DRAM into a random slot,
         # so both tables are full permutations. Destinations are spread over 4x
         # the row count so the scatter is not a disguised sequential copy.
         # --run-len > 1 keeps that shape but makes runs of consecutive rows,
         # which is the only case a group of rows can be coalesced into one DMA.
-        self.src_rows = _run_table(rows, rows, case.run_len, gen).to(torch.int32)
+        # The source table walks the whole pool: with --src-rows 131072 and 4096
+        # tokens the 4096 rows are spread over 32x more pages than a 4096-row
+        # buffer, which is the whole point of the bigger allocation.
+        #
+        # --rotate N pre-builds N source tables and hands the kernel a different
+        # one for every launch, at zero cost (the table is already on the device,
+        # so run() only picks a different slice). Without it every launch re-reads
+        # the same 4096 rows, so the IOMMU/page tables stay warm and a large pool
+        # looks cheaper than it is in production, where each step selects
+        # different rows.
+        n_tables = max(1, case.rotate)
+        tables = torch.stack(
+            [_run_table(pool, rows, case.run_len, gen) for _ in range(n_tables)]
+        ).to(torch.int32)
         self.dst_rows = _run_table(rows * 4, rows, case.run_len, gen).to(torch.int32)
 
-        self.src_kv_dev, self.src_kv_cpu = self._make_source(rows, case.ckv_dim, gen)
+        self.src_kv_dev, self.src_kv_cpu = self._make_source(pool, case.ckv_dim, gen)
         self.dst_kv = torch.zeros(rows * 4, case.ckv_dim, dtype=case.dtype, device=self.device)
         if case.copy_rope:
-            self.src_rope_dev, self.src_rope_cpu = self._make_source(rows, case.kpe_dim, gen)
+            self.src_rope_dev, self.src_rope_cpu = self._make_source(pool, case.kpe_dim, gen)
             self.dst_rope = torch.zeros(rows * 4, case.kpe_dim, dtype=case.dtype, device=self.device)
         else:
             # copy_rope=0: the rope tensors are still required by the op schema
@@ -622,20 +654,34 @@ class Bench:
         if case.table_mode == 0:
             # Identity addressing: the kernel never reads the row tables. The
             # scatter tables are then only meaningful for contiguity, so keep
-            # them linear to make this a pure copy.
-            self.src_rows = torch.arange(rows, dtype=torch.int32)
+            # them linear to make this a pure copy. This also means the copy
+            # touches rows 0..rows-1 only: --src-rows changes the allocated pool
+            # but not what this mode addresses, so it cannot show a working-set
+            # effect. main() warns about that combination.
+            tables = torch.arange(rows, dtype=torch.int32).reshape(1, rows)
             self.dst_rows = torch.arange(rows, dtype=torch.int32)
 
-        self.src_rows_dev = self.src_rows.to(self.device)
+        self.n_tables = tables.shape[0]
+        self.src_tables_cpu = tables
+        # The first table, for interactive use; run() is what advances the index
+        # and verify() reads src_tables_cpu[self._last_table] instead.
+        self.src_rows = tables[0]
+        self.src_tables_dev = tables.to(self.device)
+        # Pre-sliced views: run() must not create a tensor view per launch, that
+        # alone would cost ~1 us inside a 80 us measurement.
+        self._table_views = [self.src_tables_dev[i] for i in range(self.n_tables)]
+        self._table = 0
+        self._last_table = 0
         self.dst_rows_dev = self.dst_rows.to(self.device)
 
-    def _make_source(self, rows: int, dim: int, gen: torch.Generator):
-        values = _random_values(rows, dim, self.case.dtype, gen)
+    def _make_source(self, pool: int, dim: int, gen: torch.Generator):
+        """Source tensor of ``pool`` rows; only ``case.rows`` of them are read."""
+        values = _random_values(pool, dim, self.case.dtype, gen)
         if self.case.src == "npu":
             return values.to(self.device), None
         if self.case.src != "host":
             raise ValueError(f"unknown source placement: {self.case.src}")
-        return self._publish_host_source(values, rows, dim)
+        return self._publish_host_source(values, pool, dim)
 
     def _publish_host_source(self, values: torch.Tensor, rows: int, dim: int):
         """Return (device view, host copy) of a host buffer the NPU can read.
@@ -728,10 +774,13 @@ class Bench:
         self._host_regions.clear()
 
     def run(self) -> None:
+        # Picking a different pre-staged table costs nothing (no copy, no host
+        # round trip), so a rotating table inside the timed loop is free.
+        table = self._table_views[self._table]
         torch.ops._C_ascend.scatter_copy_ub_bench(
             self.src_kv_dev,
             self.src_rope_dev,
-            self.src_rows_dev,
+            table,
             self.dst_rows_dev,
             self.dst_kv,
             self.dst_rope,
@@ -741,6 +790,9 @@ class Bench:
             self.case.cores,
             int(self.case.copy_rope),
         )
+        self._last_table = self._table
+        if self.n_tables > 1:
+            self._table = (self._table + 1) % self.n_tables
 
     def verify(self, sample: int = 64, repeats: int = 1) -> None:
         """Compare the copied rows against the source, and report *how* they differ.
@@ -758,16 +810,20 @@ class Bench:
         sample = total if sample <= 0 else min(sample, total)
         idx = torch.arange(sample, dtype=torch.int64)
         src_flat = _comparable(self._source_cpu(self.src_kv_cpu, self.src_kv_dev))
-        want_kv = src_flat[self.src_rows[idx].to(torch.int64)]
         dst_idx = self.dst_rows[idx].to(torch.int64)
         check_rope = self.case.copy_rope
         if check_rope:
             rope_flat = _comparable(self._source_cpu(self.src_rope_cpu, self.src_rope_dev))
-            want_rope = rope_flat[self.src_rows[idx].to(torch.int64)]
 
         for attempt in range(repeats):
             self.run()
             torch.npu.synchronize()
+            # The table this launch used: with --rotate the rows differ per
+            # launch, so the reference has to be rebuilt from the same table.
+            used = self.src_tables_cpu[self._last_table]
+            want_kv = src_flat[used[idx].to(torch.int64)]
+            if check_rope:
+                want_rope = rope_flat[used[idx].to(torch.int64)]
             got_kv = _comparable(self.dst_kv[dst_idx].cpu())
             bad_kv = (got_kv != want_kv).any(dim=1)
             if check_rope:
@@ -778,7 +834,8 @@ class Bench:
                 bad_rope = torch.zeros_like(bad_kv)
             if bool(bad_kv.any()) or bool(bad_rope.any()):
                 summary = self._report_mismatch(
-                    attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope, src_flat
+                    attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
+                    src_flat, used
                 )
                 raise AssertionError(
                     f"scatter_copy_ub_bench verify failed on attempt {attempt + 1}/{repeats}: {summary}"
@@ -786,12 +843,14 @@ class Bench:
             print(
                 f"verify: attempt {attempt + 1}/{repeats} ok ({sample}/{total} rows, "
                 f"{self.case.ckv_dim}+{self.case.kpe_dim} elems x{self.case.elem_size}B, "
-                f"{self.case.bank} banks, group {self.case.group_rows}, table_mode {self.case.table_mode})",
+                f"{self.case.bank} banks, group {self.case.group_rows}, table_mode {self.case.table_mode}"
+                + ("" if self.n_tables == 1 else f", table {self._last_table + 1}/{self.n_tables}")
+                + ")",
                 flush=True,
             )
 
     def _report_mismatch(self, attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
-                         src_flat) -> str:
+                         src_flat, used) -> str:
         """Print one block per bad row and return a one-line summary.
 
         The summary is also embedded in the raised AssertionError, so the
@@ -808,7 +867,7 @@ class Bench:
         first = ""
         for r in rows[:4]:
             dst_tok = int(self.dst_rows[r])
-            src_tok = int(self.src_rows[r])
+            src_tok = int(used[r])
             got, want = got_kv[r], want_kv[r]
             cols = torch.nonzero(got != want).flatten()
             # Which source row (if any) did the destination actually receive?
@@ -868,7 +927,21 @@ def time_case(
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--rows", type=int, default=2048, help="token rows to copy per launch")
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=2048,
+        help="token rows to copy per launch (the gather count); the source tensor may be "
+        "larger, see --src-rows",
+    )
+    parser.add_argument(
+        "--src-rows",
+        type=int,
+        default=0,
+        help="rows allocated in the source (the gather pool), default = --rows. Use "
+        "131072 with --rows 4096 to measure a real KV cache shape: the copy then "
+        "walks a working set far bigger than the payload it moves",
+    )
     parser.add_argument(
         "--ckv-dim",
         type=int,
@@ -919,6 +992,16 @@ def parse_args(argv=None) -> argparse.Namespace:
         "span every NUMA node (one host link per node: this is what uses both UB ports)",
     )
     parser.add_argument(
+        "--rotate",
+        type=int,
+        default=0,
+        metavar="N",
+        help="pre-stage N source row tables and use a different one per launch (0/1 = "
+        "reuse the same rows every launch). With a big --src-rows this keeps the "
+        "page/IOMMU tables cold like production, where every step selects different "
+        "rows; the rotation costs nothing because the tables are already on the device",
+    )
+    parser.add_argument(
         "--dtype",
         choices=tuple(DTYPES),
         default="bf16",
@@ -950,7 +1033,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--sweep",
-        choices=("none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim"),
+        choices=("none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim", "src-rows"),
         default="none",
         help="iterate one knob instead of measuring a single point",
     )
@@ -969,7 +1052,16 @@ def sweep_values(name: str) -> list:
         # 16 scale + 128 rope, and the same row padded to 32 B). Comparing the
         # three groups is what tells a length penalty from an alignment one.
         "ckv-dim": [384, 512, 576, 640, 656, 672, 704, 768, 896, 1024],
+        # Working-set sweep: same 4096-row payload, pool growing 32x. This is the
+        # only way to tell "DDR got bigger and slower" from "the pool does not
+        # matter at all", and it must be run with --table-mode 1.
+        "src-rows": [4096, 16384, 32768, 65536, 131072],
     }[name]
+
+
+# A sweep name is normally the field name with dashes flattened; --src-rows is
+# the source pool, which lives in Case.pool_rows.
+SWEEP_FIELDS = {"src-rows": "pool_rows"}
 
 
 def main(argv=None) -> int:
@@ -987,6 +1079,20 @@ def main(argv=None) -> int:
     dtype = DTYPES[args.dtype][0]
     if args.kpe_dim < 0 or args.ckv_dim <= 0:
         raise SystemExit("--ckv-dim must be > 0 and --kpe-dim must be >= 0")
+    if args.rotate < 0:
+        raise SystemExit("--rotate must be >= 0")
+    if args.src_rows and args.src_rows < args.rows:
+        raise SystemExit(
+            f"--src-rows ({args.src_rows}) is the size of the source pool and must be "
+            f">= --rows ({args.rows}); lower --rows instead if you want a smaller copy"
+        )
+    if args.src_rows and args.table_mode == 0:
+        print(
+            "note: --table-mode 0 addresses rows 0..rows-1 only, so --src-rows cannot "
+            "change the working set; use --table-mode 1 to measure the big pool",
+            file=sys.stderr,
+            flush=True,
+        )
 
     base = Case(
         rows=args.rows,
@@ -1000,6 +1106,8 @@ def main(argv=None) -> int:
         ckv_dim=args.ckv_dim,
         kpe_dim=args.kpe_dim,
         run_len=args.run_len,
+        pool_rows=args.src_rows,
+        rotate=args.rotate,
     )
     row_bytes = base.row_bytes
     print(
@@ -1010,17 +1118,43 @@ def main(argv=None) -> int:
         file=sys.stderr,
         flush=True,
     )
+    if args.sweep == "src-rows":
+        values = sweep_values("src-rows")
+        print(
+            f"pool: source rows swept {values[0]}..{values[-1]} "
+            f"({values[0] * row_bytes / 2**20:.1f}..{values[-1] * row_bytes / 2**20:.1f} MiB "
+            f"{'DDR' if args.src == 'host' else 'HBM'}), {base.rows} copied per launch",
+            file=sys.stderr,
+            flush=True,
+        )
+    elif base.src_total != base.rows:
+        pool_bytes = base.src_total * row_bytes
+        print(
+            f"pool: {base.src_total} source rows ({pool_bytes / 2**20:.1f} MiB "
+            f"{'DDR' if args.src == 'host' else 'HBM'}), {base.rows} copied per launch "
+            f"({100.0 * base.rows / base.src_total:.1f}% of the pool)",
+            file=sys.stderr,
+            flush=True,
+        )
     print(dma_cost_hint(row_bytes, base.group_rows), file=sys.stderr, flush=True)
+    if base.rotate > 1:
+        print(
+            f"rows: rotating {base.rotate} pre-staged source tables, so consecutive "
+            "launches read different subsets of the pool",
+            file=sys.stderr,
+            flush=True,
+        )
 
     points: list[tuple[str, Case]] = []
     if args.sweep == "none":
         points.append(("baseline", base))
     else:
         for value in sweep_values(args.sweep):
-            case = Case(**{**base.__dict__, args.sweep.replace("-", "_"): value})
+            field = SWEEP_FIELDS.get(args.sweep, args.sweep.replace("-", "_"))
+            case = Case(**{**base.__dict__, field: value})
             points.append((f"{args.sweep}={value}", case))
 
-    header = f"{'case':>18} {'rows':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
+    header = f"{'case':>18} {'rows':>7} {'pool':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
     header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8}"
     print(header)
     print("-" * len(header))
@@ -1041,12 +1175,15 @@ def main(argv=None) -> int:
                             "src": case.src,
                             "device": case.device,
                             "rows": case.rows,
+                            "src_rows": case.src_total,
+                            "pool_bytes": case.src_total * case.row_bytes,
                             "row_bytes": case.row_bytes,
                             "dtype": args.dtype,
                             "ckv_dim": case.ckv_dim,
                             "kpe_dim": case.kpe_dim,
                             "group_rows": case.group_rows,
                             "run_len": case.run_len,
+                            "rotate": case.rotate,
                             "bank": case.bank,
                             "table_mode": case.table_mode,
                             "cores": case.cores,
@@ -1062,7 +1199,7 @@ def main(argv=None) -> int:
                 # ns/row is the number that matters when comparing row lengths:
                 # GB/s hides the fact that the DMA is charged in 256 B granules.
                 print(
-                    f"{label:>18} {case.rows:>7} {case.row_bytes:>6} {case.group_rows:>5} "
+                    f"{label:>18} {case.rows:>7} {case.src_total:>7} {case.row_bytes:>6} {case.group_rows:>5} "
                     f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
                     f"{us_min:>9.1f} {us_min * 1000.0 / case.rows:>7.1f} {gbps:>8.1f}"
                 )

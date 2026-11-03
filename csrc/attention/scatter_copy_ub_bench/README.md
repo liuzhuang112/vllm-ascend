@@ -208,12 +208,13 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dt
 输出示例：
 
 ```text
-              case    rows  B/row group bank tbl cores        us  ns/row     GB/s
---------------------------------------------------------------------------------
-          baseline    2048   1152     1    2   1     0      41.2    20.1     57.2
+              case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s
+---------------------------------------------------------------------------------------
+          baseline    2048    2048   1152     1    2   1     0      41.2    20.1     57.2
 ```
 
 `GB/s = rows × B/row / 时延`，即只统计有效载荷（读一份 + 写一份的实际带宽约为此值的 2 倍）。
+`pool` 是源张量分配的行数，默认等于 `rows`（见下文 `--src-rows`）。
 
 ## 选卡：`--device` 与 `ASCEND_RT_VISIBLE_DEVICES`
 
@@ -294,7 +295,9 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 
 | 参数 | 作用 | 建议扫描范围 |
 |:---|:---|:---|
-| `--rows` | 单次 launch 搬运的 token 行数 | 512 / 2048 / 8192 / 32768 |
+| `--rows` | 单次 launch 搬运的 token 行数（gather 的数量，不是源的大小） | 512 / 2048 / 8192 / 32768 |
+| `--src-rows` | 源张量分配多少行（gather 池），默认 = `--rows`。`131072` + `--rows 4096` 就是真实 KV cache 形状：工作集比搬的载荷大 32 倍 | 4096 / 131072 |
+| `--rotate` | 预生成 N 份行表、每次 launch 换一份（0/1 = 每次都用同一批行）。大池下用它把页表/IOMMU 缓存变冷，接近生产每步换行的情形；轮转本身零开销 | 0 / 8 / 16 |
 | `--ckv-dim` | CKV 平面每行元素数（默认 512）；乘 dtype 字节数就是行字节数，DeepSeek 系 1 字节 MLA 用 656 | 512 / 656 / 672 / 1024 |
 | `--kpe-dim` | KPE 平面每行元素数（默认 64）；`0` = 不搬 KPE（`copy_rope=0`） | 64 / 0 |
 | `--dtype` | `bf16` / `fp16` / `uint8`。1 字节 cache 行一律用 `uint8`：算子只搬字节、不做算术，所以不需要该芯片支持 fp8 | bf16 / uint8 |
@@ -314,6 +317,51 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 `--table-mode 0` 与 `--table-mode 1` 的差值，就是**每行两次 `GlobalTensor::GetValue`
 标量读**的代价。生产 kernel 里这部分开销与 DMA 是串行的，通常就是 ScatterCopy 时延里
 最容易被忽略的一块。
+
+## 大 DDR 池：131072 行里挑 4096 行（`--src-rows` / `--rotate`）
+
+真实 KV cache 不是"分配 4096 行、全搬一遍"，而是**DDR 里 131072 行，topk 挑 4096 行**。
+默认的 `--rows` 同时决定了"搬多少"和"源有多大"，测不出池子变大的影响；`--src-rows` 把两者
+拆开：
+
+```bash
+# 目标形状：DDR 82 MiB（131072 × 656 B），每次只搬 4096 行
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --src-rows 131072 \
+    --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --rotate 16 --verify
+
+# 池子本身做变量：同一份 4096 行载荷，工作集 32 倍增长
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --ckv-dim 656 --kpe-dim 0 \
+    --dtype uint8 --src host --sweep src-rows
+```
+
+输出多一列 `pool`（源张量的行数），所以"搬的量没变、池子变了"在表里一眼可见（下面的数字
+只是示意列的位置，等真机读数填进来）：
+
+```text
+          case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s
+     src-rows=4096    4096    4096    656     1    2   1     0       ...     ...      ...
+  src-rows=131072    4096  131072    656     1    2   1     0       ...     ...      ...
+```
+
+### 三个必须注意的点
+
+1. **必须 `--table-mode 1`。** `--table-mode 0` 是恒等寻址（kernel 根本不读行表），永远只碰
+   `0..rows-1` 这些行，`--src-rows` 对它没有任何影响 —— 这条组合脚本会直接打 note 提醒。
+2. **不加 `--rotate` 时，每次 launch 都读同一批 4096 行。** 那 4096 行只占 2.6 MiB，页表/IOMMU
+   表项在第一次 launch 之后就热了，测到的是"大池的**最好情况**"。`--rotate 16` 预生成 16 份行表
+   放在 device 上，每次 launch 换一份（`run()` 只是换一个切片，零拷贝零同步），才接近生产里
+   "每步 topk 都换行"的冷页表情形。两个数都测，差值就是**页表开销**，不是带宽。
+3. **`GB/s` 仍只算载荷**（`rows × B/row`），池子大小不影响这个分母；要比较"同样载荷在不同池子里
+   谁更快"，直接看 `GB/s` 或 `ns/row` 即可。内存代价是 `--src-rows × B/row` 的锁页内存：
+   656 B 行 82 MiB，bf16 1152 B 行 144 MiB。
+
+### 预期与判读
+
+- 池子变大、`--rotate` 关闭 → 差别主要来自**源地址分布变散**（同一批行散在 82 MiB 而不是
+  2.6 MiB 连续区），DDR 侧的 bank/row 命中率下降，通常是个位数百分比；
+- 池子变大 + `--rotate` 打开 → 每行都可能踩一次地址翻译 miss，这是**最坏情况**；
+- `--src npu`（源在 HBM）做同样的对比，可以把"DDR 侧效应"和"NPU MMU 侧效应"分开：两者都有页表，
+  但 HBM 没有 DDR 的 bank/row 局部性问题。
 
 ## 单平面 1 字节行：CKV_DIM=656、KPE_DIM=0（`--dtype uint8`）
 
