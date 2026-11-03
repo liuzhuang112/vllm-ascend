@@ -1033,7 +1033,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--sweep",
-        choices=("none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim", "src-rows"),
+        choices=("none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim", "src-rows", "rows"),
         default="none",
         help="iterate one knob instead of measuring a single point",
     )
@@ -1052,6 +1052,12 @@ def sweep_values(name: str) -> list:
         # 16 scale + 128 rope, and the same row padded to 32 B). Comparing the
         # three groups is what tells a length penalty from an alignment one.
         "ckv-dim": [384, 512, 576, 640, 656, 672, 704, 768, 896, 1024],
+        # Rows per launch. A launch carries a fixed cost (dispatch + tiling lookup,
+        # a few us), so a small --rows reports a low GB/s for the same row length:
+        # 512 B rows measure 41.2 GB/s at 2048 rows and 44.4 at 4096. Fit
+        # t = a * rows + b on this sweep to get that constant on the local card;
+        # it is also why every absolute number must be compared at equal --rows.
+        "rows": [1024, 2048, 4096, 8192, 16384],
         # Working-set sweep: same 4096-row payload, pool growing 32x. This is the
         # only way to tell "DDR got bigger and slower" from "the pool does not
         # matter at all", and it must be run with --table-mode 1.
@@ -1154,8 +1160,30 @@ def main(argv=None) -> int:
             case = Case(**{**base.__dict__, field: value})
             points.append((f"{args.sweep}={value}", case))
 
+    # --sweep rows changes the copy count but the pool is fixed at --src-rows, so
+    # a point can ask for more rows than the pool has; the table build would then
+    # silently come up short.
+    for label, case in points:
+        if case.src_total < case.rows:
+            raise SystemExit(
+                f"{label}: --rows ({case.rows}) exceeds the source pool "
+                f"({case.src_total}), the pool must cover the copy count"
+            )
+
+    # Under ~2 MiB per launch the fixed dispatch cost is a visible share of the
+    # time, so GB/s reads low for reasons that have nothing to do with the copy.
+    # Only for a single point: --sweep rows is the measurement of exactly this.
+    if args.sweep == "none" and base.rows <= 2048:
+        print(
+            f"note: rows={base.rows} moves only {base.rows * row_bytes / 2**20:.1f} MiB per launch, "
+            "so the fixed per-launch cost is a visible share of the latency and GB/s reads "
+            "low; compare points at equal --rows (--sweep rows shows the floor)",
+            file=sys.stderr,
+            flush=True,
+        )
+
     header = f"{'case':>18} {'rows':>7} {'pool':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
-    header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8}"
+    header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8} {'%mdl':>5}"
     print(header)
     print("-" * len(header))
     for label, case in points:
@@ -1198,10 +1226,16 @@ def main(argv=None) -> int:
             else:
                 # ns/row is the number that matters when comparing row lengths:
                 # GB/s hides the fact that the DMA is charged in 256 B granules.
+                # %mdl is measured / modelled throughput at this row length and
+                # group size: 100 means the run lands exactly on the 256 B model,
+                # well below 100 means it pays for a merge it never got (the whole
+                # group is all-or-nothing, so run_len=1 never merges).
+                model = predict_gbps(case.row_bytes, case.group_rows)
                 print(
                     f"{label:>18} {case.rows:>7} {case.src_total:>7} {case.row_bytes:>6} {case.group_rows:>5} "
                     f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
-                    f"{us_min:>9.1f} {us_min * 1000.0 / case.rows:>7.1f} {gbps:>8.1f}"
+                    f"{us_min:>9.1f} {us_min * 1000.0 / case.rows:>7.1f} {gbps:>8.1f} "
+                    f"{100.0 * gbps / model:>5.0f}"
                 )
                 if us_med != us_min:
                     print(f"{'':>18} median {us_med:.1f} us")

@@ -196,6 +196,9 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --sweep bank
 # 扫描：行表标量读的代价（table_mode=1 vs 0）
 python benchmarks/kernel/scatter_copy_ub_bench.py --sweep table-mode
 
+# 扫描：每次 launch 搬多少行（斜率是每行成本，截距就是 launch 固定开销）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --sweep rows
+
 # 真实 DRAM → HBM（源在 host 锁页内存，经 UVA 映射给 device）
 # 脚本会自己把 pinned_mem_register:True 加进 PYTORCH_NPU_ALLOC_CONF；
 # 若 torch_npu 已被提前 import，则先手动 export 该变量再运行。
@@ -208,13 +211,15 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dt
 输出示例：
 
 ```text
-              case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s
----------------------------------------------------------------------------------------
-          baseline    2048    2048   1152     1    2   1     0      41.2    20.1     57.2
+              case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s  %mdl
+-----------------------------------------------------------------------------------------------
+          baseline    2048    2048   1152     1    2   1     0      41.2    20.1     57.2   103
 ```
 
 `GB/s = rows × B/row / 时延`，即只统计有效载荷（读一份 + 写一份的实际带宽约为此值的 2 倍）。
 `pool` 是源张量分配的行数，默认等于 `rows`（见下文 `--src-rows`）。
+`%mdl` 是**实测 / 256 B 计费模型的预测**：100 表示正好落在这条线上，明显低于 100 表示
+"按 k 行的价付了钱、却没真合并"（合并是整组 all-or-nothing，`--run-len 1` 时永远合不上）。
 
 ## 选卡：`--device` 与 `ASCEND_RT_VISIBLE_DEVICES`
 
@@ -338,9 +343,9 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --ckv-dim 656 --kp
 只是示意列的位置，等真机读数填进来）：
 
 ```text
-          case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s
-     src-rows=4096    4096    4096    656     1    2   1     0       ...     ...      ...
-  src-rows=131072    4096  131072    656     1    2   1     0       ...     ...      ...
+          case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s  %mdl
+     src-rows=4096    4096    4096    656     1    2   1     0       ...     ...      ...   ...
+  src-rows=131072    4096  131072    656     1    2   1     0       ...     ...      ...   ...
 ```
 
 ### 三个必须注意的点
@@ -355,11 +360,65 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --ckv-dim 656 --kp
    谁更快"，直接看 `GB/s` 或 `ns/row` 即可。内存代价是 `--src-rows × B/row` 的锁页内存：
    656 B 行 82 MiB，bf16 1152 B 行 144 MiB。
 
-### 预期与判读
+### 实测：512 B 行上池子完全不敏感（这就是结论）
 
-- 池子变大、`--rotate` 关闭 → 差别主要来自**源地址分布变散**（同一批行散在 82 MiB 而不是
-  2.6 MiB 连续区），DDR 侧的 bank/row 命中率下降，通常是个位数百分比；
-- 池子变大 + `--rotate` 打开 → 每行都可能踩一次地址翻译 miss，这是**最坏情况**；
+`--rows 4096 --ckv-dim 512 --kpe-dim 0 --dtype uint8 --src host`（单卡，同一进程内三次运行）：
+
+| 配置 | 池 | 每次 launch 读的行 | GB/s |
+|:---|:---|:---|:---|
+| `--src-rows 131072 --rotate 16` | 64 MiB DDR | 每 launch 换一份，16 份轮转 | **44.4** |
+| `--src-rows 131072`（无 rotate） | 64 MiB DDR | 每次都同一批 4096 行 | **44.4** |
+| 不给 `--src-rows` | 2 MiB DDR | 全部（`pool == rows`） | **44.5** |
+
+三者差 0.2%，也就是**没有差别**，而且这是预期内的，原因不是"DDR 大池不慢"，而是**这个行长已经把
+DMA 吃满了，没有局部性可赚**：
+
+- 512 B = 正好 2 个 256 B 计费格、无尾巴、无浪费，模型 42.7 GB/s，实测 44.4（`%mdl` ≈ 104）；
+- 一行一次 DMA、每次 512 B，池子多大都是"一个 512 B 请求"；64 MiB 池子的页在 setup 阶段就被
+  `_publish_host_source` 全量写过（页已实、映射已建），地址翻译和 DDR bank/row miss 都被多 outstanding
+  请求的流水盖住了，而不是串行付钱；
+- 报告的 `GB/s` 只除载荷（`rows × B/row`），池子不进分母，所以"池子变大"本身不会体现在这个数上。
+
+**什么情况下才会看到池子的影响**（按可疑度排序）：
+
+1. 换行字长。真正吃亏的是"计费格有浪费"的行长（656 付 768 B），但那是**长度**效应，不是池效应；
+2. 池子跨越 MMU 覆盖范围：几百 MiB ~ GiB，或访问步长大于 DDR 页大小，才是地址翻译/bank 冲突的
+   可测区；
+3. 链路本身见顶。512 B 的 44.4 GB/s（扣掉 launch 固定项后 ≈48 GB/s）和 1024 B 的 44.3 已经是这台机器
+   见过的最高档，要判断是不是**host 链路**先见顶，用 `--sweep src`（npu vs host）分开看 —— 两者接近
+   说明瓶颈在 DMA 引擎，不在 DDR。
+
+**一个容易踩的坑**：不要拿不同 `--rows` 的读数比池子。上一节十点表里的 512 B = 41.2 是
+`--rows 2048` 测的，本表 44.4 是 `--rows 4096`；这 7% 来自每次 launch 的固定开销（见下），与池子无关。
+
+### 每次 launch 的固定开销：约 3.7 µs
+
+同样的 512 B 行，`--rows 2048` 41.2 GB/s、`--rows 4096` 44.4 GB/s。两者相减就能把这个常数拟出来：
+
+```text
+t(2048) = 2048×512 / 41.2e9 = 25.5 us
+t(4096) = 4096×512 / 44.4e9 = 47.2 us
+边际 2048 行 = 21.8 us  ->  每行 10.6 ns（≈48 GB/s），固定项 = 25.5 − 21.8 ≈ 3.7 us
+```
+
+也就是说**每次 launch 有 ~3.7 µs 与行数无关的固定成本**（kernel 起块 / 首行延迟 / 收尾 drain），
+在 4096 行时占 8%，在 2048 行时占 14%。扣掉它之后每行只有 10.6 ns（≈48 GB/s），比模型在 2048 行上
+给出的 12.0 ns 更快 —— 因为模型是在 2048 行上拟的，一部分固定成本被吸收进了斜率（那个 0.41 ns/row
+的常数项其实主要就是它摊下来的）。
+
+实践含义：
+
+- **绝对数只在相同 `--rows` 下可比**，跨表比行长时要么统一 `--rows`，要么只比 `ns/row`；
+- 生产里每步搬的行越多（或把多步合一次 launch），这 3.7 µs 摊得越薄；
+- 想在本卡上直接量它：`--sweep rows`（1024/2048/4096/8192/16384，对 `us` 列做线性拟合）；
+- 预测可验：656 B 行在 `--rows 4096` 上应从 32.0 抬到约 **33.5 GB/s**（固定项摊薄 5%），
+  仍然远低于合并 k 行的 41 GB/s —— 主因还是 768 B 计费，不是固定开销。
+
+### 预期与判读（通用）
+
+- 池子变大 + `--rotate` 打开、行长达标（如 512 B）→ 数不动，属正常；
+- 池子变大 + `--rotate` 打开、行长偏短（如 656 B）→ 每行可能踩一次地址翻译 miss，是**最坏情况**，
+  但大概率仍被 DMA 计费盖住；
 - `--src npu`（源在 HBM）做同样的对比，可以把"DDR 侧效应"和"NPU MMU 侧效应"分开：两者都有页表，
   但 HBM 没有 DDR 的 bank/row 局部性问题。
 
@@ -416,6 +475,10 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dt
   差别只在它们的尾巴（144 / 160 / 192 B）超过了 128 B。128 B 整数倍那条假设因此被否掉
   （896 = 7×128 只有 38.8，576 = 4.5×128 反而和 640 一样）。
 - 结论：**656 的 32.0 GB/s 是「768 B + 超半格尾巴」的必然结果**，跟数据量、对齐、行数都无关。
+
+十点是 `rows 2048` 测的，每次 launch 里还含着约 3.7 µs 的固定项（见「大 DDR 池」一节的
+「每次 launch 的固定开销」），所以 512 B 在这里是 41.2、在 `rows 4096` 上是 44.4。行长之间的
+**相对**关系不受这个常数影响（它加在每一行上），但跨表比绝对数时务必对齐 `--rows`。
 
 脚本启动时会把这条行本身的计费、以及「合并 k 行」的整条预测曲线一起打出来：
 
