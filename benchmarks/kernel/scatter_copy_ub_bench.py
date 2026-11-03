@@ -56,6 +56,17 @@ Examples:
     python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --src-rows 131072 \
         --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --rotate 16
 
+    # is the host link the limiter, or the DMA engine? Same rows, both sources:
+    # 656 B measures 33 GB/s over the host link and 91 GB/s from HBM, so the
+    # 256 B billing is the link's, not the engine's
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --ckv-dim 656 \
+        --kpe-dim 0 --dtype uint8 --sweep src
+
+    # a launch costs 3.3 us before any row moves: this slope is the per-row cost
+    # and the intercept is that constant, which is why small --rows reads low
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --ckv-dim 656 \
+        --kpe-dim 0 --dtype uint8 --src host --sweep rows
+
 Two separate products must exist before the first run, from the repository
 root::
 
@@ -142,65 +153,91 @@ def _op_registered() -> bool:
 
 
 # --- what one row's DMA costs -------------------------------------------------
-# Empirical model of one A5 part (host -> HBM, 32 AIV), fitted to two sweeps:
+# Empirical model of the host path (DDR -> UB -> HBM, one A5 die), fitted to three
+# sweeps. Measured ns/row, and what the model says after the launch constant is
+# taken out (the launch cost is 3.3 us per launch, i.e. 1.6 ns/row at 2048 rows):
 #
-#   len B   ns/row   charged   ns per 256 B      (--sweep ckv-dim, 656 B rows)
-#     384      12.4      512         6.21
-#     512      12.4      512         6.21
-#     576      17.7      768         5.91
-#     640      17.7      768         5.91
-#     656      20.5      768         6.83   <- tail 144 B > 128 B
-#     672      20.6      768         6.85   <- tail 160 B
-#     704      20.6      768         6.86   <- tail 192 B
-#     768      18.4      768         6.14
-#     896      23.1     1024         5.77
-#    1024      23.1     1024         5.78
+#   len B   meas ns/row  U   tail   pure ns/row   ns per 256 B   (--sweep ckv-dim, 2048 rows)
+#     384      12.4       2   128      10.7          5.35
+#     512      12.4       2     0      10.7          5.35
+#     576      17.7       3    64      16.0          5.34
+#     640      17.7       3   128      16.0          5.34
+#     656      20.5       3   144      18.9          5.34  + 2.9 tail
+#     672      20.6       3   160      18.9          5.35  + 2.9 tail
+#     704      20.6       3   192      18.9          5.35  + 2.9 tail
+#     768      18.4       3     0      16.8          5.59
+#     896      23.1       4   128      21.4          5.35
+#    1024      23.1       4     0      21.4          5.34
 #
-#   and the same rows merged k at a time (--table-mode 0 --sweep group-rows):
+#   the same 656 B rows merged k at a time (--table-mode 0 --sweep group-rows, 2048 rows):
 #
-#   group_rows=1  3 granules      20.1 ns/row   32.7 GB/s
-#   group_rows=2  6 granules      34.7 ns/DMA   37.8 GB/s   (17.4 ns/row)
-#   group_rows=4 11 granules      63.7 ns/DMA   41.2 GB/s   (15.9 ns/row)
-#   group_rows=8 21 granules     122.3 ns/DMA   42.9 GB/s   (15.3 ns/row)
+#   group_rows=1  3 granules    20.1 ns/row    32.7 GB/s
+#   group_rows=2  6 granules    34.7 ns/DMA    37.8 GB/s   (17.4 ns/row)
+#   group_rows=4 11 granules    63.7 ns/DMA    41.2 GB/s   (15.9 ns/row)
+#   group_rows=8 21 granules   122.3 ns/DMA    42.9 GB/s   (15.3 ns/row)
 #
-# Least squares on all fourteen points:
+#   and rows per launch at 656 B (--sweep rows, same row, host):
 #
-#   t = 0.4 + 5.79 ns * ceil(len / 256) + 2.65 ns * (len % 256 > 128)
+#   1024 rows 29.8 | 2048 31.9 | 4096 33.2 | 8192 33.9 | 16384 34.3 GB/s
+#   -> t = 3.33 us + 18.93 ns * rows, i.e. a fixed 3.3 us per launch and 18.9 ns/row
 #
-# mean |error| 1.5%. So the transfer is charged in 256 B granules at ~44.2 GB/s
-# per granule, plus a surcharge when the tail crosses the half granule. The
-# consequence for a 656 B row: one DMA per row pays 3 granules and the surcharge
-# (20.4 ns for 656 B = 32 GB/s), while four rows in one DMA pay 11 granules
-# (16.0 ns/row = 41 GB/s). It is an empirical model of one machine, not a
-# documented rule -- which is why it is only ever printed as a hint.
+# Least squares over all eighteen points:
+#
+#   t = 3300 ns + rows * (5.35 ns * ceil(len/256) + 2.9 ns * (len % 256 > 128))
+#
+# max |error| 4% (the 768 B point), most points within 1%. Two things follow, and
+# both were mistakes in an earlier reading of the same data:
+#
+#   * the ~0.4 ns/row "constant" of the first fit was the launch cost in disguise.
+#     It belongs to the launch, so a small --rows always reads low: 656 B is 31.9
+#     GB/s at 2048 rows and 34.3 at 16384 for exactly the same per-row work.
+#   * the per-row asymptote for 656 B is 34.6 GB/s, not 32 -- 32 was 2048 rows of
+#     a number that has a 3.3 us floor in it.
+#
+# Scope: every number above is --src host. With --src npu the same 656 B row runs
+# at 90.9 GB/s (2.6x), so the 256 B billing below is a property of the host link,
+# not of the DMA engine. That is why the column is called %host, not %model.
+# It is an empirical model of one machine, not a documented rule -- which is why it
+# is only ever printed as a hint.
 DMA_GRANULE_BYTES = 256
-DMA_FIXED_NS = 0.41
-DMA_NS_PER_GRANULE = 5.79
-DMA_TAIL_SURCHARGE_NS = 2.65
+DMA_NS_PER_GRANULE = 5.35
+DMA_TAIL_SURCHARGE_NS = 2.9
+LAUNCH_NS = 3300.0
 
 
 def dma_ns(nbytes: int) -> tuple[float, int, int]:
-    """(predicted ns, charged bytes, tail bytes) for one DMA of `nbytes`."""
+    """(pure ns, charged bytes, tail bytes) for one DMA of `nbytes`, no launch cost."""
     units = -(-nbytes // DMA_GRANULE_BYTES) if nbytes > 0 else 0
     tail = nbytes % DMA_GRANULE_BYTES
-    ns = DMA_FIXED_NS + units * DMA_NS_PER_GRANULE
+    ns = units * DMA_NS_PER_GRANULE
     if tail > DMA_GRANULE_BYTES // 2:
         ns += DMA_TAIL_SURCHARGE_NS
     return ns, units * DMA_GRANULE_BYTES, tail
 
 
-def predict_gbps(row_bytes: int, group_rows: int = 1) -> float:
-    """Model throughput of moving `group_rows` rows in one DMA."""
+def predict_gbps(row_bytes: int, group_rows: int = 1, rows: int | None = None) -> float:
+    """Model throughput of moving `group_rows` rows in one DMA.
+
+    With `rows` the launch constant is amortised over that many tokens, which is
+    the only way to compare against a measurement (a run never has infinite rows).
+    Without it the answer is the asymptote (rows -> infinity).
+    """
     ns, _, _ = dma_ns(row_bytes * group_rows)
+    if rows:
+        # One launch covers rows/group_rows DMAs, so this many ns land on each DMA
+        # (per row it is LAUNCH_NS / rows either way).
+        ns += LAUNCH_NS * group_rows / rows
     return float("inf") if ns <= 0 else row_bytes * group_rows / ns
 
 
-def merge_curve(row_bytes: int, ks: tuple[int, ...] = (1, 2, 3, 4, 6, 8)) -> str:
+def merge_curve(
+    row_bytes: int, ks: tuple[int, ...] = (1, 2, 3, 4, 6, 8), rows: int | None = None
+) -> str:
     """The predicted GB/s of merging k rows, for k in `ks`."""
-    return " | ".join(f"k={k} {predict_gbps(row_bytes, k):.0f}" for k in ks)
+    return " | ".join(f"k={k} {predict_gbps(row_bytes, k, rows):.0f}" for k in ks)
 
 
-def dma_cost_hint(row_bytes: int, group_rows: int = 1) -> str:
+def dma_cost_hint(row_bytes: int, group_rows: int = 1, rows: int | None = None) -> str:
     """What one row's DMA is charged for, and what merging rows would buy."""
     ns, charged, tail = dma_ns(row_bytes)
     units = charged // DMA_GRANULE_BYTES
@@ -210,17 +247,17 @@ def dma_cost_hint(row_bytes: int, group_rows: int = 1) -> str:
     text += f") -> ~{ns:.1f} ns/row (~{row_bytes / ns:.0f} GB/s useful)"
     if charged > row_bytes:
         text += f"; the other {charged - row_bytes} B of the granule are free"
-    curve = merge_curve(row_bytes)
+    curve = merge_curve(row_bytes, rows=rows)
     ceiling = DMA_GRANULE_BYTES / DMA_NS_PER_GRANULE  # B/ns == GB/s
     lines = [
         text,
-        f"     model t = {DMA_FIXED_NS:.1f} + {DMA_NS_PER_GRANULE:.2f} ns/granule + "
-        f"{DMA_TAIL_SURCHARGE_NS:.2f} ns if tail > 128 B; per-granule ceiling "
-        f"{ceiling:.1f} GB/s",
-        f"     merging rows (one DMA per group): {curve} GB/s"
+        f"     model t = {LAUNCH_NS / 1000:.1f} us per launch + rows * ({DMA_NS_PER_GRANULE:.2f} ns "
+        f"per 256 B + {DMA_TAIL_SURCHARGE_NS:.1f} ns if tail > 128 B); {ceiling:.1f} GB/s per granule",
+        f"     merging rows (one DMA per group, at {rows or 'infinite'} rows): {curve} GB/s"
         + ("" if group_rows == 1 else f"  <- now running k={group_rows}, model says "
-                                      f"{predict_gbps(row_bytes, group_rows):.0f}"),
-        f"     where this row can go: {max(predict_gbps(row_bytes, k) for k in range(1, 9)):.0f} GB/s "
+                                      f"{predict_gbps(row_bytes, group_rows, rows):.0f}"),
+        f"     where this row can go: "
+        f"{max(predict_gbps(row_bytes, k, rows) for k in range(1, 9)):.0f} GB/s "
         f"at k=8 (needs 8 adjacent rows on both sides)",
     ]
     return "\n".join(lines)
@@ -1142,7 +1179,15 @@ def main(argv=None) -> int:
             file=sys.stderr,
             flush=True,
         )
-    print(dma_cost_hint(row_bytes, base.group_rows), file=sys.stderr, flush=True)
+    print(dma_cost_hint(row_bytes, base.group_rows, base.rows), file=sys.stderr, flush=True)
+    if base.src == "npu":
+        print(
+            "note: the model above is fitted on --src host. On --src npu the same row runs "
+            "far faster (656 B: 90.9 GB/s, 2.6x), so %host >> 100 means 'the host link, not "
+            "the DMA engine, was the limiter in the fit' -- not a broken measurement",
+            file=sys.stderr,
+            flush=True,
+        )
     if base.rotate > 1:
         print(
             f"rows: rotating {base.rotate} pre-staged source tables, so consecutive "
@@ -1183,7 +1228,7 @@ def main(argv=None) -> int:
         )
 
     header = f"{'case':>18} {'rows':>7} {'pool':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
-    header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8} {'%mdl':>5}"
+    header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8} {'%host':>5}"
     print(header)
     print("-" * len(header))
     for label, case in points:
@@ -1219,6 +1264,9 @@ def main(argv=None) -> int:
                             "us_median": us_med,
                             "ns_per_row": us_min * 1000.0 / case.rows,
                             "gbps": gbps,
+                            "host_model_gbps": predict_gbps(
+                                case.row_bytes, case.group_rows, case.rows
+                            ),
                         }
                     ),
                     flush=True,
@@ -1226,11 +1274,12 @@ def main(argv=None) -> int:
             else:
                 # ns/row is the number that matters when comparing row lengths:
                 # GB/s hides the fact that the DMA is charged in 256 B granules.
-                # %mdl is measured / modelled throughput at this row length and
-                # group size: 100 means the run lands exactly on the 256 B model,
-                # well below 100 means it pays for a merge it never got (the whole
-                # group is all-or-nothing, so run_len=1 never merges).
-                model = predict_gbps(case.row_bytes, case.group_rows)
+                # %host is measured / host-path model at this row length, group
+                # size and row count: ~100 means the run lands on the model, well
+                # below 100 means it pays for a merge it never got (the whole group
+                # is all-or-nothing, so run_len=1 never merges), and far above 100
+                # means the source is not crossing the host link (--src npu).
+                model = predict_gbps(case.row_bytes, case.group_rows, case.rows)
                 print(
                     f"{label:>18} {case.rows:>7} {case.src_total:>7} {case.row_bytes:>6} {case.group_rows:>5} "
                     f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
