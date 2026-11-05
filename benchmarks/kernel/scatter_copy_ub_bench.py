@@ -81,6 +81,16 @@ Examples:
         --space-rows '131072*32' --kpe-dim 0 --dtype uint8 --src host \
         --sweep row-bytes
 
+    # does polling more partitions cost anything? 1/2/4/8/16/32/64/78 spaces with
+    # the same per-space pool: total DDR grows with the count, the payload per
+    # launch does not. --sweep grid is the row-length x space-count matrix in one
+    # run, and --xlsx puts it in a workbook (one sheet per dimension)
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows \
+        '131072*32' --kpe-dim 0 --dtype uint8 --src host --sweep spaces
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows \
+        '131072*32' --kpe-dim 0 --dtype uint8 --src host --sweep grid \
+        --xlsx bench_spaces.xlsx
+
 Two separate products must exist before the first run, from the repository
 root::
 
@@ -110,12 +120,16 @@ a still-missing op then really does mean a stale ``vllm_ascend_C``.
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
+import gc
 import json
 import os
 import shutil
+import socket
 import statistics
 import sys
+from datetime import datetime
 from dataclasses import dataclass
 from functools import cache
 
@@ -461,6 +475,22 @@ def _count(text: str) -> int:
     if total <= 0:
         raise argparse.ArgumentTypeError(f"count must be positive: {text!r}")
     return total
+
+
+def _parse_int_list(text: str, flag: str) -> list[int]:
+    """``"256,512,1024"`` -> ``[256, 512, 1024]``, for the grid row lengths."""
+    out: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(_count(part))
+        except argparse.ArgumentTypeError as exc:
+            raise SystemExit(f"{flag}: {exc}") from None
+    if not out:
+        raise SystemExit(f"{flag} needs at least one value, e.g. 256,512,1024")
+    return out
 
 
 def _parse_device(text: str) -> int:
@@ -1330,10 +1360,24 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--sweep",
         choices=(
             "none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim",
-            "row-bytes", "src-rows", "rows",
+            "row-bytes", "src-rows", "rows", "spaces", "grid",
         ),
         default="none",
-        help="iterate one knob instead of measuring a single point",
+        help="iterate one knob instead of measuring a single point; 'grid' is the "
+        "row-length x space-count matrix",
+    )
+    parser.add_argument(
+        "--grid-row-bytes",
+        default=",".join(str(v) for v in GRID_ROW_BYTES),
+        help="row lengths in bytes for --sweep grid (default %(default)s); add 656 to "
+        "put the production row in the same matrix",
+    )
+    parser.add_argument(
+        "--xlsx",
+        default="",
+        help="write every measured point to this .xlsx workbook: one row per point, "
+        "plus a GB/s matrix and a pass-time matrix when the sweep covers two "
+        "dimensions. Needs openpyxl; without it a .csv of the same rows is written",
     )
     return parser.parse_args(argv)
 
@@ -1365,12 +1409,224 @@ def sweep_values(name: str) -> list:
         # only way to tell "DDR got bigger and slower" from "the pool does not
         # matter at all", and it must be run with --table-mode 1.
         "src-rows": [4096, 16384, 32768, 65536, 131072],
+        # How many independent DDR partitions take part in one pass. Production
+        # polls 78 of them; 1 is the control (a single base pointer, one
+        # contiguous region). --space-rows is held fixed, so total DDR grows with
+        # the count while the payload per launch does not -- that is what makes
+        # this the measurement of "does the address span cost anything".
+        "spaces": [1, 2, 4, 8, 16, 32, 64, 78],
     }[name]
+
+
+# --sweep grid walks these row lengths x every space count above. 256 and 1024
+# are whole granules, 512 is two of them; add 656 with --grid-row-bytes to see
+# the production row in the same matrix (it is the only one with a tail).
+GRID_ROW_BYTES = (256, 512, 1024)
 
 
 # A sweep name is normally the field name with dashes flattened; --src-rows is
 # the source pool, which lives in Case.pool_rows.
 SWEEP_FIELDS = {"src-rows": "pool_rows"}
+
+
+def _guard_memory(case: Case) -> None:
+    """Refuse a case that cannot fit, before any of it is allocated.
+
+    Checked per point rather than once: --sweep spaces grows total DDR with the
+    count, so the last point is the one that does not fit, and finding that out
+    after 20 points of setup is a waste of an hour.
+    """
+    need = case.total_pool_bytes
+    try:
+        phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        return
+    if phys and need > 0.85 * phys:
+        raise SystemExit(
+            f"{case.spaces} space(s) x {case.src_total} rows x {case.row_bytes} B needs "
+            f"{need / 2**30:.0f} GiB of {'pinned host memory' if case.src == 'host' else 'HBM'} "
+            f"but the machine has {phys / 2**30:.0f} GiB; lower --spaces or --space-rows, "
+            "or check --dry-run first"
+        )
+
+
+def _plan_line(case: Case) -> str:
+    """One line per space count: what the run will allocate and move."""
+    pass_rows = case.spaces * case.rows
+    return (
+        f"  {case.spaces:>3} space(s) x {case.src_total:>8} rows = "
+        f"{case.total_pool_bytes / 2**30:>7.1f} GiB DDR, "
+        f"pass {pass_rows * case.row_bytes / 2**30:>6.2f} GiB, "
+        f"tables {case.spaces * max(1, case.rotate) * case.rows * 4 / 2**20:>5.0f} MiB"
+    )
+
+
+def _print_matrix(records: list[dict], key: str, title: str, fmt: str) -> None:
+    """Rows = row length, columns = space count; blank where nothing was measured."""
+    ok = [r for r in records if r.get("status") == "ok"]
+    lens = sorted({r["row B"] for r in ok})
+    spaces = sorted({r["spaces"] for r in ok})
+    if len(lens) < 2 or len(spaces) < 2:
+        return
+    cell = {(r["row B"], r["spaces"]): r.get(key) for r in ok}
+    width = max(len(title), 8) + 2
+    print(f"\n{title}")
+    print(f"{'B/row':>{width}}" + "".join(f"{s:>9}" for s in spaces))
+    for rb in lens:
+        line = f"{rb:>{width}}"
+        for s in spaces:
+            v = cell.get((rb, s))
+            line += f"{'':>9}" if v is None else f"{format(v, fmt):>9}"
+        print(line)
+
+
+def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
+    """Dump the measured points: one sheet per dimension, plus the raw rows.
+
+    openpyxl is optional -- the harness has to run on a node where it may not be
+    installed -- so a missing wheel degrades to a .csv with exactly the same rows
+    instead of losing the measurements.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        csv_path = os.path.splitext(path)[0] + ".csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=RESULT_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(records)
+        print(
+            f"xlsx: openpyxl is not installed, wrote {csv_path} instead "
+            "(pip install openpyxl for the matrix workbook)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    head_fill = PatternFill("solid", fgColor="1F3864")
+    head_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="BFBFBF")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def style_header(ws, row: int, ncols: int) -> None:
+        for c in range(1, ncols + 1):
+            cell = ws.cell(row=row, column=c)
+            cell.fill = head_fill
+            cell.font = head_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = border
+
+    wb = Workbook()
+
+    # --- sheet 1: one row per measured point -------------------------------
+    ws = wb.active
+    ws.title = "结果"
+    ws.append(RESULT_COLUMNS)
+    style_header(ws, 1, len(RESULT_COLUMNS))
+    for rec in records:
+        ws.append([rec.get(col) for col in RESULT_COLUMNS])
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(RESULT_COLUMNS))}{ws.max_row}"
+    width = {
+        "case": 16, "row B": 8, "spaces": 8, "pool rows": 12, "launch MiB": 11,
+        "src": 6, "banks": 7, "group": 7, "tbl": 6, "cores": 7, "us": 10,
+        "ns/row": 9, "GB/s": 9, "model GB/s": 12, "%host": 8, "pass ms": 11,
+        "space min us": 13,
+        "space max us": 13, "max/min": 9, "total DDR GiB": 14, "dst MiB": 10,
+        "status": 10,
+    }
+    for i, col in enumerate(RESULT_COLUMNS, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = width.get(col, 11)
+    numfmt = {
+        "GB/s": "0.0", "model GB/s": "0.0", "ns/row": "0.00", "%host": "0", "us": "0.0",
+        "pass ms": "0.00", "space min us": "0.0", "space max us": "0.0",
+        "max/min": "0.000", "launch MiB": "0.0", "dst MiB": "0",
+        "total DDR GiB": "0.00",
+    }
+    for i, col in enumerate(RESULT_COLUMNS, start=1):
+        if col in numfmt:
+            for cell in ws[get_column_letter(i)][1:]:
+                cell.number_format = numfmt[col]
+
+    # --- sheets 2 and 3: the two dimensions as a matrix -------------------
+    ok = [r for r in records if r.get("status") == "ok"]
+    lens = sorted({r["row B"] for r in ok})
+    spaces = sorted({r["spaces"] for r in ok})
+    if len(lens) > 1 and len(spaces) > 1:
+        # Sheet names may not contain / \ * ? : [ ], hence "GBps" and "pass_ms".
+        for title, key, fmt in (
+            ("GBps", "GB/s", "0.0"),
+            ("pass_ms", "pass ms", "0.00"),
+            ("max_min", "max/min", "0.000"),
+        ):
+            ws = wb.create_sheet(title)
+            with_model = key == "GB/s"
+            ws.append(
+                [f"B/row \\ spaces"] + spaces + (["model k=1 (host)"] if with_model else [])
+            )
+            style_header(ws, 1, len(spaces) + (2 if with_model else 1))
+            cell = {(r["row B"], r["spaces"]): r[key] for r in ok}
+            model = {r["row B"]: r["model GB/s"] for r in ok}
+            for rb in lens:
+                ws.append(
+                    [rb]
+                    + [cell.get((rb, s)) for s in spaces]
+                    + ([model.get(rb)] if with_model else [])
+                )
+            for row in ws.iter_rows(min_row=2):
+                for c in row[1:]:
+                    c.number_format = fmt
+            ws.column_dimensions["A"].width = 16
+            for i in range(2, len(spaces) + (3 if with_model else 2)):
+                ws.column_dimensions[get_column_letter(i)].width = 10
+            ws.freeze_panes = "B2"
+
+    # --- last sheet: what was run, and how to read it ---------------------
+    ws = wb.create_sheet("说明")
+    rows = [
+        ("生成时间", meta.get("when", "")),
+        ("命令", meta.get("cmd", "")),
+        ("主机", meta.get("host", "")),
+        ("device", meta.get("device", "")),
+        ("源位置 src", meta.get("src", "")),
+        ("每 launch 行数", meta.get("rows", "")),
+        ("每 space 行数", meta.get("space_rows", "")),
+        ("table_mode", meta.get("table_mode", "")),
+        ("group_rows", meta.get("group_rows", "")),
+        ("run_len", meta.get("run_len", "")),
+        ("rotate", meta.get("rotate", "")),
+        ("计时", meta.get("timing", "")),
+        ("", ""),
+        ("GB/s", "rows x B/row / 时延，只算有效载荷；读一份 + 写一份的实际链路带宽约为 2 倍"),
+        ("%host", "实测 / host 路径模型（predict_gbps）。100 = 正好在模型线上；"
+                  "远低于 100 = 按合并的价付钱却没合并成；远高于 100 = 源不走 host 链路"),
+        ("pass ms", "spaces x us，即一次轮询所有分区的时间"),
+        ("max/min", "一个 pass 内各 space 时延的 max/min，接近 1 说明分区均匀"),
+        ("model k=1", "单行单次 DMA 的 256 B 计费模型预测（host 路径）"),
+        ("", ""),
+        ("注意", "spaces 变化时每 space 的池子和每次 launch 的载荷都不变，"
+                 "唯一变化是总 DDR 与 base 指针个数；所以这一列若有斜率，就是地址跨度在付钱"),
+    ]
+    for k, v in rows:
+        ws.append([k, v])
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 100
+    for row in ws.iter_rows(min_row=1):
+        row[0].font = Font(bold=True)
+        row[1].alignment = Alignment(wrap_text=True, vertical="top")
+
+    wb.save(path)
+    print(f"xlsx: wrote {path} ({len(records)} point(s))", file=sys.stderr, flush=True)
+
+
+RESULT_COLUMNS = [
+    "case", "row B", "spaces", "pool rows", "launch MiB", "src", "banks", "group",
+    "tbl", "cores", "us", "ns/row", "GB/s", "model GB/s", "%host", "pass ms",
+    "space min us", "space max us", "max/min", "total DDR GiB", "dst MiB", "status",
+]
+
 
 
 def main(argv=None) -> int:
@@ -1470,22 +1726,11 @@ def main(argv=None) -> int:
             file=sys.stderr,
             flush=True,
         )
-        need = base.total_pool_bytes
-        try:
-            phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-        except (ValueError, OSError, AttributeError):
-            phys = 0
-        if phys and need > 0.85 * phys:
-            raise SystemExit(
-                f"this case needs {need / 2**30:.0f} GiB of "
-                f"{'pinned host memory' if base.src == 'host' else 'HBM'} but the machine "
-                f"has {phys / 2**30:.0f} GiB; lower --spaces or --space-rows, or check "
-                "--dry-run first"
-            )
+        _guard_memory(base)
         print(
             "note: allocation is {:.0f} GiB, and only the rows each table points at are "
             "given payload, so setup is a malloc plus one fill per space, not a full "
-            "rewrite".format(need / 2**30),
+            "rewrite".format(base.total_pool_bytes / 2**30),
             file=sys.stderr,
             flush=True,
         )
@@ -1499,6 +1744,36 @@ def main(argv=None) -> int:
             flush=True,
         )
     if args.dry_run:
+        if args.sweep in ("grid", "spaces"):
+            # The last space count allocates 78x what the first one does, so the
+            # point of --dry-run here is to see the whole ladder before the
+            # setup time is spent: one line per point, nothing allocated.
+            lens = (
+                _parse_int_list(args.grid_row_bytes, "--grid-row-bytes")
+                if args.sweep == "grid"
+                else [row_bytes]
+            )
+            for rb in lens:
+                print(f"dry-run: {rb} B rows", file=sys.stderr, flush=True)
+                for spaces in sweep_values("spaces"):
+                    probe = Case(
+                        **{
+                            **base.__dict__,
+                            "ckv_dim": rb // base.elem_size,
+                            "kpe_dim": 0,
+                            "spaces": spaces,
+                            "space_rows": space_rows,
+                        }
+                    )
+                    print(_plan_line(probe), file=sys.stderr, flush=True)
+                    _guard_memory(probe)
+            print(
+                f"dry-run: {len(lens)} row length(s) x {len(sweep_values('spaces'))} space "
+                "counts, nothing was allocated",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 0
         print(
             f"dry-run: {base.spaces} space(s) x {base.src_total} rows x {row_bytes} B = "
             f"{base.total_pool_bytes / 2**30:.2f} GiB source, "
@@ -1527,6 +1802,43 @@ def main(argv=None) -> int:
     points: list[tuple[str, Case]] = []
     if args.sweep == "none":
         points.append(("baseline", base))
+    elif args.sweep == "grid":
+        # The row length x space count matrix. Every point keeps --space-rows, so
+        # the per-space pool is identical across the grid and only the number of
+        # base pointers (and the total DDR behind them) changes.
+        grid_bytes = _parse_int_list(args.grid_row_bytes, "--grid-row-bytes")
+        for rb in grid_bytes:
+            if rb % base.elem_size:
+                raise SystemExit(
+                    f"--grid-row-bytes {rb} is not a whole number of {base.elem_size} B "
+                    "elements; use --dtype uint8 for byte-exact row lengths"
+                )
+            for spaces in sweep_values("spaces"):
+                case = Case(
+                    **{
+                        **base.__dict__,
+                        "ckv_dim": rb // base.elem_size,
+                        "kpe_dim": 0,
+                        "spaces": spaces,
+                        "space_rows": space_rows,
+                    }
+                )
+                points.append((f"{rb}B x{spaces}", case))
+        print(
+            f"grid: {len(grid_bytes)} row length(s) {grid_bytes} x "
+            f"{len(sweep_values('spaces'))} space counts {sweep_values('spaces')} "
+            f"= {len(points)} points, each point reallocates",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            "      space count -> what one pass allocates and moves:",
+            file=sys.stderr,
+            flush=True,
+        )
+        for spaces in sweep_values("spaces"):
+            sample = next(c for lb, c in points if c.spaces == spaces)
+            print(_plan_line(sample), file=sys.stderr, flush=True)
     else:
         for value in sweep_values(args.sweep):
             if args.sweep == "row-bytes":
@@ -1541,15 +1853,30 @@ def main(argv=None) -> int:
                 case = Case(
                     **{**base.__dict__, "ckv_dim": value // base.elem_size, "kpe_dim": 0}
                 )
-                points.append((f"row-bytes={value}", case))
+                points.append((f"{value}B", case))
                 continue
             field = SWEEP_FIELDS.get(args.sweep, args.sweep.replace("-", "_"))
             case = Case(**{**base.__dict__, field: value})
-            points.append((f"{args.sweep}={value}", case))
+            label = f"x{value}" if args.sweep == "spaces" else f"{args.sweep}={value}"
+            points.append((label, case))
     if args.sweep == "row-bytes" and base.kpe_dim > 0:
         print(
             "note: --sweep row-bytes measures the whole row in the CKV plane, so the "
             "KPE plane is off for every point",
+            file=sys.stderr,
+            flush=True,
+        )
+    if args.sweep == "grid" and args.spaces != 1:
+        print(
+            f"note: --sweep grid drives its own space counts, --spaces {args.spaces} is ignored",
+            file=sys.stderr,
+            flush=True,
+        )
+    if args.sweep == "spaces" and not (args.space_rows or args.src_rows):
+        print(
+            "note: --space-rows was not given, so every space is only --rows big and the "
+            "sweep changes the base-pointer count without growing DDR; pass --space-rows "
+            "to reproduce the production pool",
             file=sys.stderr,
             flush=True,
         )
@@ -1580,8 +1907,30 @@ def main(argv=None) -> int:
     header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8} {'%host':>5}"
     print(header)
     print("-" * len(header))
-    for label, case in points:
-        bench = Bench(case)
+
+    records: list[dict] = []
+    failures = 0
+    multi = len(points) > 1
+    for index, (label, case) in enumerate(points, start=1):
+        if multi:
+            # A 24-point grid is mostly setup (200 GiB of pinned memory per
+            # point), so the progress line says which point is paying for it.
+            print(f"[{index}/{len(points)}] {label}", file=sys.stderr, flush=True)
+        try:
+            _guard_memory(case)
+            bench = Bench(case)
+        except (Exception, SystemExit) as exc:  # one point must not cost the sheet
+            failures += 1
+            print(f"{label:>18} setup failed: {exc}", flush=True)
+            records.append(
+                {
+                    "case": label,
+                    "row B": case.row_bytes,
+                    "spaces": case.spaces,
+                    "status": f"setup failed: {exc}",
+                }
+            )
+            continue
         try:
             if args.verify:
                 bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
@@ -1595,6 +1944,35 @@ def main(argv=None) -> int:
             if case.spaces > 1:
                 bench.time_spaces()
                 per_space = bench.time_spaces()
+            model = predict_gbps(case.row_bytes, case.group_rows, case.rows)
+            lo = min(per_space) if per_space else None
+            hi = max(per_space) if per_space else None
+            dst_rows = case.rows * case.dst_slack * (1 if case.dst_shared else case.spaces)
+            rec = {
+                "case": label,
+                "row B": case.row_bytes,
+                "spaces": case.spaces,
+                "pool rows": case.src_total,
+                "launch MiB": case.rows * case.row_bytes / 2**20,
+                "src": case.src,
+                "banks": case.bank,
+                "group": case.group_rows,
+                "tbl": case.table_mode,
+                "cores": case.cores,
+                "us": us_min,
+                "ns/row": us_min * 1000.0 / case.rows,
+                "GB/s": gbps,
+                "model GB/s": model,
+                "%host": 100.0 * gbps / model,
+                "pass ms": us_min * case.spaces / 1000.0,
+                "space min us": lo,
+                "space max us": hi,
+                "max/min": (hi / lo) if (lo and hi) else None,
+                "total DDR GiB": case.total_pool_bytes / 2**30,
+                "dst MiB": dst_rows * case.row_bytes / 2**20,
+                "status": "ok",
+            }
+            records.append(rec)
             if args.json:
                 # One record per point on stdout, nothing else, so a driver script
                 # (host_link_scale.py) can aggregate several processes.
@@ -1626,11 +2004,10 @@ def main(argv=None) -> int:
                             "ns_per_row": us_min * 1000.0 / case.rows,
                             "gbps": gbps,
                             "pass_us": us_min * case.spaces,
-                            "space_us_min": min(per_space) if per_space else None,
-                            "space_us_max": max(per_space) if per_space else None,
-                            "host_model_gbps": predict_gbps(
-                                case.row_bytes, case.group_rows, case.rows
-                            ),
+                            "space_us_min": lo,
+                            "space_us_max": hi,
+                            "status": "ok",
+                            "host_model_gbps": model,
                         }
                     ),
                     flush=True,
@@ -1643,7 +2020,6 @@ def main(argv=None) -> int:
                 # below 100 means it pays for a merge it never got (the whole group
                 # is all-or-nothing, so run_len=1 never merges), and far above 100
                 # means the source is not crossing the host link (--src npu).
-                model = predict_gbps(case.row_bytes, case.group_rows, case.rows)
                 print(
                     f"{label:>18} {case.rows:>7} {case.spaces:>3} {case.src_total:>7} "
                     f"{case.row_bytes:>6} {case.group_rows:>5} "
@@ -1654,16 +2030,60 @@ def main(argv=None) -> int:
                 if us_med != us_min:
                     print(f"{'':>18} median {us_med:.1f} us")
                 if per_space:
-                    lo, hi = min(per_space), max(per_space)
                     print(
                         f"{'':>18} pass {case.spaces} x {us_min:.1f} us = "
                         f"{us_min * case.spaces / 1000.0:.2f} ms; per-space "
                         f"{lo:.1f}..{hi:.1f} us (max/min {hi / lo:.3f})"
                     )
+        except (Exception, SystemExit) as exc:  # keep the other points running
+            failures += 1
+            print(f"{label:>18} measurement failed: {exc}", flush=True)
+            records.append(
+                {
+                    "case": label,
+                    "row B": case.row_bytes,
+                    "spaces": case.spaces,
+                    "status": f"measurement failed: {exc}",
+                }
+            )
         finally:
             # Host sources stay registered (and the device may still be reading
             # them) until every launch has retired.
             bench.close()
+            # 200 GiB per point: drop the tensors before the next point asks for
+            # its own, or the second allocation fails on a machine that fit one.
+            del bench
+            gc.collect()
+
+    _print_matrix(records, "GB/s", "GB/s by row length x space count", "0.1f")
+    _print_matrix(records, "pass ms", "pass 时延 ms by row length x space count", "0.2f")
+    if args.xlsx:
+        _write_workbook(
+            args.xlsx,
+            records,
+            {
+                "when": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "cmd": " ".join([os.path.basename(sys.argv[0]), *(list(argv) if argv else sys.argv[1:])]),
+                "host": socket.gethostname(),
+                "device": args.device,
+                "src": args.src,
+                "rows": args.rows,
+                "space_rows": space_rows,
+                "table_mode": args.table_mode,
+                "group_rows": args.group_rows,
+                "run_len": args.run_len,
+                "rotate": args.rotate,
+                "timing": f"warmup {args.warmup}, iters {args.iters}, rounds {args.rounds}",
+            },
+        )
+    if failures:
+        print(
+            f"{failures}/{len(points)} point(s) failed; the rest are in the table"
+            + (f" and {args.xlsx}" if args.xlsx else ""),
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     return 0
 
 

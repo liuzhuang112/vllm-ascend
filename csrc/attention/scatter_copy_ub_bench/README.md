@@ -303,11 +303,14 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 |:---|:---|:---|
 | `--rows` | 单次 launch 搬运的 token 行数（gather 的数量，不是源的大小） | 512 / 2048 / 8192 / 32768 |
 | `--src-rows` | 源张量分配多少行（gather 池），默认 = `--rows`。`131072` + `--rows 4096` 就是真实 KV cache 形状：工作集比搬的载荷大 32 倍。支持乘积写法，`'131072*32'` = 4194304 | 4096 / 131072 |
-| `--spaces` | 独立源区域个数，**一次 launch 轮询一个**（默认 1 = 只有一个池，即旧行为）。生产形状是 78 个 cache 分区，每分区 `--space-rows` 行，每个分区搬 `--rows` 行，一个 pass 读完 78 个 | 1 / 78 |
+| `--spaces` | 独立源区域个数，**一次 launch 轮询一个**（默认 1 = 只有一个池，即旧行为）。生产形状是 78 个 cache 分区，每分区 `--space-rows` 行，每个分区搬 `--rows` 行，一个 pass 读完 78 个 | 1 / 2 / 4 / 8 / 16 / 32 / 64 / 78（`--sweep spaces`） |
 | `--space-rows` | 每个分区的行数，默认取 `--src-rows`、再不行取 `--rows`。生产是 `'131072*32'` = 4194304 行（32 请求 × 128K token） | `'131072*32'` |
 | `--dst-slack` | 目的端为"每行"分配几个槽位（散写程度）。`0` = 自动：单分区 4、多分区 1（78 × 196608 × 4 × 656 B 会是 37 GiB HBM，而载荷只有 9.4 GiB） | 0 / 1 / 4 |
 | `--dst-shared` | 所有分区写同一段目的端（覆盖写）。默认关闭：生产把 78 次 gather 拼起来，覆盖写会被 cache 吸收掉一部分流量 | 开关 |
-| `--dry-run` | 只打印分配规划（每分区字节数、总 DDR、表大小、pass 载荷）然后退出，不分配。跑 200 GiB 之前先看这个 | 开关 |
+| `--dry-run` | 只打印分配规划（每分区字节数、总 DDR、表大小、pass 载荷）然后退出，不分配。配 `--sweep spaces` / `--sweep grid` 时逐点打印，跑 200~312 GiB 之前先看这个 | 开关 |
+| `--sweep grid` | 行长 × 分区数 的矩阵（默认 256/512/1024 B × 1/2/4/8/16/32/64/78 = 24 点），每点重新分配池 | 开关 |
+| `--grid-row-bytes` | 配合 `--sweep grid` 的行长列表，逗号分隔；加 656 就把生产行放进同一张矩阵 | `256,512,1024` / `256,512,656,1024` |
+| `--xlsx` | 把每个测点写成 xlsx：`结果` + `GBps` / `pass_ms` / `max_min` 三张矩阵 + `说明`。没有 openpyxl 时退化成同名 `.csv` | 路径 |
 | `--rotate` | 预生成 N 份行表、每次 launch 换一份（0/1 = 每次都用同一批行）。大池下用它把页表/IOMMU 缓存变冷，接近生产每步换行的情形；轮转本身零开销 | 0 / 8 / 16 |
 | `--ckv-dim` | CKV 平面每行元素数（默认 512）；乘 dtype 字节数就是行字节数，DeepSeek 系 1 字节 MLA 用 656 | 512 / 656 / 672 / 1024 |
 | `--kpe-dim` | KPE 平面每行元素数（默认 64）；`0` = 不搬 KPE（`copy_rope=0`） | 64 / 0 |
@@ -521,6 +524,80 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --spaces 78 \
 | 78 分区明显偏低（>5%） | 跨度/页表/IOMMU 真的在付钱 | 看 `max/min`：均匀 → 换 `--dst-slack 4` 排除写侧；不均 → 查 NUMA |
 | `max/min` > 1.05 | 某一批分区偏慢 | `--host-interleave`、`numactl --cpunodebind`、或换 `--device` |
 | pass 时间 **小于** 78 × `us` | 78 次 launch 在 device 侧重叠了 | 正常（run() 不同步），按 pass 时间算吞吐 |
+
+### 分区数扫描：`--sweep spaces` / `--sweep grid`（结果导成 xlsx）
+
+78 是生产的终值，但要判断"轮询分区数本身要不要钱"，得把它当变量：**1 / 2 / 4 / 8 / 16 / 32 / 64 / 78**，
+每个 `--space-rows` 都不变，所以每分区的池子、每次 launch 的载荷、搬的比例全都固定，
+**唯一变化的是 base 指针个数和它背后的总 DDR**。
+
+```bash
+# 一个维度：分区数，行长固定
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows '131072*32' \
+    --ckv-dim 512 --kpe-dim 0 --dtype uint8 --src host --sweep spaces
+
+# 两个维度：3 种行长 × 8 个分区数 = 24 点，直接写成 xlsx
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows '131072*32' \
+    --kpe-dim 0 --dtype uint8 --src host --sweep grid --xlsx bench_spaces.xlsx
+
+# 同样的矩阵，但先看每个点要多少内存（不分配）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows '131072*32' \
+    --kpe-dim 0 --dtype uint8 --src host --sweep grid --dry-run
+```
+
+`--sweep grid` 的行长默认 **256 / 512 / 1024 B**（都是 256 B 的整格，即最干净的对照组），
+加 `--grid-row-bytes 256,512,656,1024` 就把生产的 656 B 一起放进同一张矩阵。
+
+`--dry-run` 会逐点打印规划，因为**最后一个点是第一个点的 78 倍内存**：
+
+```text
+dry-run: 1024 B rows
+    1 space(s) x  4194304 rows =     4.0 GiB DDR, pass   0.19 GiB, tables     1 MiB
+    8 space(s) x  4194304 rows =    32.0 GiB DDR, pass   1.50 GiB, tables     6 MiB
+   78 space(s) x  4194304 rows =   312.0 GiB DDR, pass  14.62 GiB, tables    58 MiB
+```
+
+每个点都会完整地分配→测量→释放（`gc.collect()` + 逐段 unregister），所以 24 点就是 24 轮
+setup；1024 B 那一行光分配/释放就可能占掉大半时间。中途某个点失败（内存不够、注册失败）
+**不会终止整轮**：它记成一行 `status=setup failed: ...`，其余点照跑，最后一次写出表格，退出码 1。
+
+#### 预期形状
+
+256 / 512 / 1024 都是整格计费、单行已经在 ~44 GB/s 的上限，所以**矩阵应当是平的**：
+
+| 行 \ 分区数 | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 78 |
+|:---|:---|:---|:---|:---|:---|:---|:---|:---|
+| 256 B | 44 | 44 | 44 | 44 | 44 | 44 | 44 | 44 |
+| 512 B | 44 | 44 | 44 | 44 | 44 | 44 | 44 | 44 |
+| 1024 B | 44 | 44 | 44 | 44 | 44 | 44 | 44 | 44 |
+
+**平 → 地址跨度免费，容量直接按 256 B 模型算。出现向下斜率（78 分区比 1 分区低 >5%）
+→ 跨度/页表/IOMMU 在付钱**，这时看同一张表里的 `max/min` 列：均匀说明是"总量变大"的
+系统性代价，不均说明是个别分区被放坏了（NUMA / 页表深度），换 `--host-interleave` 或 `--device`。
+
+pass 时延那一列是 `spaces × us`，随分区数线性增长，斜率就是"一次 launch 的价"：
+
+| 行 \ 分区数 | 1 | 8 | 78 |
+|:---|:---|:---|:---|
+| 256 B | 1.1 ms | 8.8 ms | 86 ms |
+| 512 B | 2.2 ms | 17.6 ms | 172 ms |
+| 1024 B | 4.4 ms | 35 ms | 344 ms |
+
+（按 44 GB/s 算；实际含 78 × 3.3 µs 的 launch 固定开销，只占 0.3%。）
+
+#### xlsx 里有什么
+
+`--xlsx PATH` 一次写 5 个 sheet（需要 `openpyxl`，没有则退化成同名 `.csv` 并提示）：
+
+| sheet | 内容 |
+|:---|:---|
+| `结果` | 每个点一行，22 列：配置（行 B / 分区数 / 池行数 / bank / group / table）、`us`、`ns/row`、`GB/s`、`model GB/s`、`%host`、`pass ms`、`space min/max us`、`max/min`、池总量、dst 大小、`status`；冻结首行 + 自动筛选 |
+| `GBps` | **行长 × 分区数** 的吞吐矩阵，末列是单行模型预测 |
+| `pass_ms` | 同一个矩阵，值是 pass 时延（ms） |
+| `max_min` | 同一个矩阵，值是一个 pass 内逐分区时延的 max/min（1.000 = 完全均匀） |
+| `说明` | 生成时间、完整命令行、主机、device、src、rows/space-rows、bank/group/run-len/rotate、计时参数，以及每列的含义 |
+
+`结果` 里 `status != ok` 的行保留失败原因，不会静默丢掉；矩阵里缺的点是空格，不是 0。
 
 ### 三个实现细节（会影响读数，先知道再跑）
 
