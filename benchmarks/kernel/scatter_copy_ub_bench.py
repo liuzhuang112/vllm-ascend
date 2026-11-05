@@ -1453,10 +1453,13 @@ def _guard_memory(case: Case) -> None:
 def _plan_line(case: Case) -> str:
     """One line per space count: what the run will allocate and move."""
     pass_rows = case.spaces * case.rows
+    dst_rows = pass_rows * case.dst_slack
     return (
         f"  {case.spaces:>3} space(s) x {case.src_total:>8} rows = "
         f"{case.total_pool_bytes / 2**30:>7.1f} GiB DDR, "
         f"pass {pass_rows * case.row_bytes / 2**30:>6.2f} GiB, "
+        f"dst {dst_rows * case.row_bytes / 2**30:>6.2f} GiB "
+        f"(x{case.dst_slack}), "
         f"tables {case.spaces * max(1, case.rotate) * case.rows * 4 / 2**20:>5.0f} MiB"
     )
 
@@ -1556,8 +1559,13 @@ def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
     spaces = sorted({r["spaces"] for r in ok})
     if len(lens) > 1 and len(spaces) > 1:
         # Sheet names may not contain / \ * ? : [ ], hence "GBps" and "pass_ms".
+        # nsrow is the length-independent view: GB/s folds the row length into the
+        # answer, so 256 B at 25 GB/s and 512 B at 46 GB/s look like "2x" when the
+        # cost per row is actually 1.1x (10.1 vs 11.2 ns). Read that sheet before
+        # concluding anything about a row length.
         for title, key, fmt in (
             ("GBps", "GB/s", "0.0"),
+            ("nsrow", "ns/row", "0.00"),
             ("pass_ms", "pass ms", "0.00"),
             ("max_min", "max/min", "0.000"),
         ):
@@ -1600,6 +1608,8 @@ def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
         ("计时", meta.get("timing", "")),
         ("", ""),
         ("GB/s", "rows x B/row / 时延，只算有效载荷；读一份 + 写一份的实际链路带宽约为 2 倍"),
+        ("ns/row", "每行耗时，与行长无关的比较口径。GB/s 把行长折进了答案：256 B 的 25 GB/s "
+                   "和 512 B 的 46 GB/s 看起来差一倍，实际每行成本只差 10%"),
         ("%host", "实测 / host 路径模型（predict_gbps）。100 = 正好在模型线上；"
                   "远低于 100 = 按合并的价付钱却没合并成；远高于 100 = 源不走 host 链路"),
         ("pass ms", "spaces x us，即一次轮询所有分区的时间"),
@@ -1608,6 +1618,9 @@ def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
         ("", ""),
         ("注意", "spaces 变化时每 space 的池子和每次 launch 的载荷都不变，"
                  "唯一变化是总 DDR 与 base 指针个数；所以这一列若有斜率，就是地址跨度在付钱"),
+        ("dst_slack", "目的行数 / 拷贝行数。auto 是 1 个 space 用 4、多个 space 用 1；"
+                      "spaces/grid 扫描时整条阶梯统一钉成 1，否则 1-space 那一点的目标区"
+                      "比其余点大 4 倍，阶梯的第一级会同时变两个变量"),
     ]
     for k, v in rows:
         ws.append([k, v])
@@ -1697,6 +1710,38 @@ def main(argv=None) -> int:
         file=sys.stderr,
         flush=True,
     )
+    # A spaces/grid sweep is only a measurement of the space count if everything
+    # else is held. dst_slack is not: its auto value is 4 for one space and 1 for
+    # many, so resolving it per point would give the spaces=1 rung -- and only
+    # that rung -- a 4x, one-quarter-covered destination, and the ladder would
+    # then move two variables between its first two points. Pin the whole ladder
+    # to the many-space value, which is also the faithful one: production
+    # concatenates the gathers, so every destination row is written exactly once.
+    ladder_slack = args.dst_slack
+    if args.sweep in ("spaces", "grid"):
+        top = sweep_values("spaces")[-1]
+        top_row_bytes = (
+            max(_parse_int_list(args.grid_row_bytes, "--grid-row-bytes"))
+            if args.sweep == "grid"
+            else row_bytes
+        )
+        if ladder_slack <= 0:
+            ladder_slack = 1
+            print(
+                "note: every point of a spaces/grid sweep uses --dst-slack 1; auto "
+                "would give only the 1-space point a 4x destination, so its first rung "
+                "would differ in two ways at once",
+                file=sys.stderr,
+                flush=True,
+            )
+        elif ladder_slack > 1:
+            print(
+                f"note: --dst-slack {ladder_slack} at {top} spaces needs "
+                f"{top * base.rows * ladder_slack * top_row_bytes / 2**30:.0f} GiB of "
+                "HBM for the destination alone",
+                file=sys.stderr,
+                flush=True,
+            )
     if args.sweep == "src-rows":
         values = sweep_values("src-rows")
         print(
@@ -1763,6 +1808,7 @@ def main(argv=None) -> int:
                             "kpe_dim": 0,
                             "spaces": spaces,
                             "space_rows": space_rows,
+                            "dst_slack": ladder_slack,
                         }
                     )
                     print(_plan_line(probe), file=sys.stderr, flush=True)
@@ -1821,6 +1867,7 @@ def main(argv=None) -> int:
                         "kpe_dim": 0,
                         "spaces": spaces,
                         "space_rows": space_rows,
+                        "dst_slack": ladder_slack,
                     }
                 )
                 points.append((f"{rb}B x{spaces}", case))
@@ -1859,6 +1906,14 @@ def main(argv=None) -> int:
             case = Case(**{**base.__dict__, field: value})
             label = f"x{value}" if args.sweep == "spaces" else f"{args.sweep}={value}"
             points.append((label, case))
+    if args.sweep in ("spaces", "grid") and ladder_slack != args.dst_slack:
+        # --sweep spaces builds its points in the generic branch above, which
+        # copies the base case's already-resolved dst_slack; rewrite it so the
+        # whole ladder shares one destination layout.
+        points = [
+            (label, Case(**{**case.__dict__, "dst_slack": ladder_slack}))
+            for label, case in points
+        ]
     if args.sweep == "row-bytes" and base.kpe_dim > 0:
         print(
             "note: --sweep row-bytes measures the whole row in the CKV plane, so the "
