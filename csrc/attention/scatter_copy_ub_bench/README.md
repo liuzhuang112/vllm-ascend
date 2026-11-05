@@ -211,9 +211,9 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --ckv-dim 656 --kpe-dim 0 --dt
 输出示例：
 
 ```text
-              case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s %host
------------------------------------------------------------------------------------------------
-          baseline    2048    2048   1152     1    2   1     0      41.2    20.1     57.2   103
+              case    rows spc    pool  B/row group bank tbl cores        us  ns/row     GB/s %host
+---------------------------------------------------------------------------------------------------
+          baseline    2048   1    2048   1152     1    2   1     0      41.2    20.1     57.2   103
 ```
 
 `GB/s = rows × B/row / 时延`，即只统计有效载荷（读一份 + 写一份的实际带宽约为此值的 2 倍）。
@@ -302,7 +302,12 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | 参数 | 作用 | 建议扫描范围 |
 |:---|:---|:---|
 | `--rows` | 单次 launch 搬运的 token 行数（gather 的数量，不是源的大小） | 512 / 2048 / 8192 / 32768 |
-| `--src-rows` | 源张量分配多少行（gather 池），默认 = `--rows`。`131072` + `--rows 4096` 就是真实 KV cache 形状：工作集比搬的载荷大 32 倍 | 4096 / 131072 |
+| `--src-rows` | 源张量分配多少行（gather 池），默认 = `--rows`。`131072` + `--rows 4096` 就是真实 KV cache 形状：工作集比搬的载荷大 32 倍。支持乘积写法，`'131072*32'` = 4194304 | 4096 / 131072 |
+| `--spaces` | 独立源区域个数，**一次 launch 轮询一个**（默认 1 = 只有一个池，即旧行为）。生产形状是 78 个 cache 分区，每分区 `--space-rows` 行，每个分区搬 `--rows` 行，一个 pass 读完 78 个 | 1 / 78 |
+| `--space-rows` | 每个分区的行数，默认取 `--src-rows`、再不行取 `--rows`。生产是 `'131072*32'` = 4194304 行（32 请求 × 128K token） | `'131072*32'` |
+| `--dst-slack` | 目的端为"每行"分配几个槽位（散写程度）。`0` = 自动：单分区 4、多分区 1（78 × 196608 × 4 × 656 B 会是 37 GiB HBM，而载荷只有 9.4 GiB） | 0 / 1 / 4 |
+| `--dst-shared` | 所有分区写同一段目的端（覆盖写）。默认关闭：生产把 78 次 gather 拼起来，覆盖写会被 cache 吸收掉一部分流量 | 开关 |
+| `--dry-run` | 只打印分配规划（每分区字节数、总 DDR、表大小、pass 载荷）然后退出，不分配。跑 200 GiB 之前先看这个 | 开关 |
 | `--rotate` | 预生成 N 份行表、每次 launch 换一份（0/1 = 每次都用同一批行）。大池下用它把页表/IOMMU 缓存变冷，接近生产每步换行的情形；轮转本身零开销 | 0 / 8 / 16 |
 | `--ckv-dim` | CKV 平面每行元素数（默认 512）；乘 dtype 字节数就是行字节数，DeepSeek 系 1 字节 MLA 用 656 | 512 / 656 / 672 / 1024 |
 | `--kpe-dim` | KPE 平面每行元素数（默认 64）；`0` = 不搬 KPE（`copy_rope=0`） | 64 / 0 |
@@ -344,10 +349,13 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --ckv-dim 656 --kp
 只是示意列的位置，等真机读数填进来）：
 
 ```text
-          case    rows    pool  B/row group bank tbl cores        us  ns/row     GB/s %host
-     src-rows=4096    4096    4096    656     1    2   1     0       ...     ...      ...   ...
-   src-rows=131072    4096  131072    656     1    2   1     0       ...     ...      ...   ...
+              case    rows spc    pool  B/row group bank tbl cores        us  ns/row     GB/s %host
+---------------------------------------------------------------------------------------------------
+     src-rows=4096    4096   1    4096    656     1    2   1     0       ...     ...      ...   ...
+   src-rows=131072    4096   1  131072    656     1    2   1     0       ...     ...      ...   ...
 ```
+
+`spc` 是轮询的源分区数（默认 1），见下文 `--spaces`。
 
 ### 三个必须注意的点
 
@@ -429,6 +437,108 @@ t = 3.33 us + 18.93 ns × rows      (五点残差 ≤ 0.7%)
   但大概率仍被 DMA 计费盖住；
 - `--src npu`（源在 HBM）做同样的对比，可以把"DDR 侧效应"和"NPU MMU 侧效应"分开：两者都有页表，
   但 HBM 没有 DDR 的 bank/row 局部性问题。
+
+## 78 个 DDR 空间轮询：`--spaces` / `--space-rows`
+
+生产形状不是"一个池、挑几行"，而是 **78 个独立 DDR 分区，每个分区 131072 × 32 行，
+每次从每个分区搬 196608 行，78 个分区轮着来**：
+
+```text
+spaces                78            DDR 分区数
+space_rows      131072×32 = 4194304  每分区行数（32 请求 × 128K token）
+rows               196608            每次每分区搬的行数（topk 2048 × mtp 3 × 32 请求）
+row_bytes             656            1 字节 MLA 行
+一 个 pass          78 次 launch，15335424 行，9.37 GiB 载荷
+池总量          78 × 2.56 GiB = 200 GiB DDR
+```
+
+单池测不出这件事：`--src-rows` 变大只是让**一个** base 指针覆盖更多页，而 78 个分区是
+**78 个不同的 base**，相邻两次 launch 的地址跳 2.56 GiB。地址翻译层级、IOMMU 表项、
+DDR bank/row 命中都可能因此变差，而 `GB/s` 的分母不变，所以差异会直接出现在数上。
+
+```bash
+# 0) 先看规划，不分配：200 GiB 之前务必跑这条
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --spaces 78 \
+    --space-rows '131072*32' --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --dry-run
+
+# 1) 单分区基线（2.56 GiB 池，一个 base 指针）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --src-rows '131072*32' \
+    --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --device 0
+
+# 2) 78 分区（200 GiB DDR，78 个 base 指针）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --spaces 78 \
+    --space-rows '131072*32' --ckv-dim 656 --kpe-dim 0 --dtype uint8 --src host --device 0
+
+# 3) 四种行长的完整一轮（每个点都会重新分配池，串行释放）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --spaces 78 \
+    --space-rows '131072*32' --kpe-dim 0 --dtype uint8 --src host --sweep row-bytes
+```
+
+第 1 条和第 2 条的差别**只有地址跨度**（每分区搬的比例、行表形状、行长全都一样），
+所以两者之差就是"78 个分区轮询"本身的代价。想再拆一层，可以把第 1 条换成
+`--spaces 1 --src-rows '131072*32'`（同一条命令）与 `--spaces 78 --space-rows '131072*32'`
+对比 —— 前者所有分区的数据挤在一个 2.56 GiB 区间里。
+
+### 四种行长的资源预算
+
+`--spaces 78 --space-rows '131072*32'`、每次每分区 196608 行：
+
+| 行长 | 每分区池 | 总 DDR | 每 launch | 一个 pass | 预期 pass 时延 | 预期 GB/s |
+|:---|:---|:---|:---|:---|:---|:---|
+| 256 B | 1.00 GiB | 78 GiB | 48 MiB | 3.66 GiB | ~89 ms | ~44 |
+| 512 B | 2.00 GiB | 156 GiB | 96 MiB | 7.31 GiB | ~178 ms | ~44 |
+| 656 B | 2.56 GiB | **200 GiB** | 123 MiB | 9.37 GiB | ~292 ms | ~34.5 |
+| 1024 B | 4.00 GiB | 312 GiB | 192 MiB | 14.62 GiB | ~355 ms | ~44.3 |
+
+预期值来自 256 B 计费模型（`t = 3.3 µs + rows × (5.35 ns × ⌈len/256⌉ + 2.9 ns 若尾巴 > 128 B)`）：
+256 / 512 / 1024 都是整格，落在 ~48 GB/s 的上限（实测 44 左右）；656 是 768 B + 超半格尾巴，
+只有 ~34.6。**pass 时延里有 78 × 3.3 µs = 257 µs 的 launch 固定开销，占 0.07%~0.3%，可忽略** ——
+"78 次轮询"本身不是成本，成本只可能来自地址跨度。
+
+### 输出怎么读
+
+表里多一列 `spc`（分区数），多分区时每个点还会打一行 pass 汇总：
+
+```text
+              case    rows spc    pool  B/row group bank tbl cores        us  ns/row     GB/s %host
+---------------------------------------------------------------------------------------------------
+          baseline  196608  78 4194304    656     1    2   1     0    3738.4    19.0     34.5   100
+                       pass 78 x 3738.4 us = 291.60 ms; per-space 3712.5..3768.9 us (max/min 1.015)
+```
+
+- `us` 是**一次 launch** 的平均（200 次 iters 跨了 2~3 个 pass，均摊了分区差异）；
+- `pass` 行是 `spc × us`，以及**一次 pass 里逐分区实测**的最小/最大值。`max/min` 是重点：
+  接近 1 说明 78 个分区完全均匀；某个分区明显偏慢就是 NUMA 放置或页表深度的问题，
+  用 `--host-interleave` 或绑核再看一次；
+- `%host` 仍按单次载荷算，多分区不改变它的含义；`GB/s` 也是**单次 launch** 的，不是 pass 的
+  （两者相等，因为 pass 就是 78 次同样的 launch）。
+
+### 判读
+
+| 现象 | 含义 | 下一步 |
+|:---|:---|:---|
+| 78 分区的 `GB/s` ≈ 单分区的 `GB/s` | 地址跨度无影响，计费模型照旧 | 直接按 256 B 模型规划容量 |
+| 78 分区明显偏低（>5%） | 跨度/页表/IOMMU 真的在付钱 | 看 `max/min`：均匀 → 换 `--dst-slack 4` 排除写侧；不均 → 查 NUMA |
+| `max/min` > 1.05 | 某一批分区偏慢 | `--host-interleave`、`numactl --cpunodebind`、或换 `--device` |
+| pass 时间 **小于** 78 × `us` | 78 次 launch 在 device 侧重叠了 | 正常（run() 不同步），按 pass 时间算吞吐 |
+
+### 三个实现细节（会影响读数，先知道再跑）
+
+1. **池按需填充。** 每个分区的 2.56 GiB 只 malloc + 锁页，只有行表点到的那 196608 行
+   （123 MiB）被写进随机数据；其余行是未初始化内存，而校验读的是同一块 host 内存，
+   所以 `--verify` 依然逐字节严格。否则 78 × 2.56 GiB 的随机填充要几十分钟。
+2. **行表是 78 张，共 58 MiB HBM**，全部预上传，`run()` 只换切片，切换分区零开销。
+   `--rotate N` 会变成 78 × N 张，表内存和建表时间都乘 N（`randperm(4194304)` 每张约 30 ms）。
+3. **目的端默认每分区一段**（`--dst-slack` 自动取 1，共 9.37 GiB HBM），因为生产把 78 次
+   gather 拼起来。`--dst-shared` 改成覆盖写同一个 123 MiB 窗口，会少写 9.2 GiB，读数偏乐观。
+   单分区时 `--dst-slack` 自动取 4，与旧行为一致。
+
+### 200 GiB 锁页内存的前置条件
+
+- `ulimit -l unlimited`（或至少大于池大小），否则 `pin_memory` 直接失败；
+- 每分区一次独立的 `aclrtHostRegisterV2`，78 段；`close()` 会逐段 unregister；
+- 分配和释放各要几十秒（78 × 2.56 GiB），`--sweep row-bytes` 跑四个点就要四轮；
+- 物理内存不够时脚本会**在分配前**用 `SC_PHYS_PAGES` 拦下并报错，不会跑到一半 OOM。
 
 ## 单平面 1 字节行：CKV_DIM=656、KPE_DIM=0（`--dtype uint8`）
 
@@ -830,6 +940,15 @@ socket 的 DRAM 要么路由不通、要么不按地址位分口，靠页放置�
 - `group-rows > 1` 只有在**源行连续**（`src_rows` 步长为 1）时才会合并读侧 DMA；
   写侧允许任意正向步长，与生产里 miss pair 的合并写一致。随机行表下会退化成逐行 DMA，
   这正是我们想看到的「合并能不能用」的结论。
+- `--spaces N` 会分配 N 段独立的源内存，不是一个张量的 N 个视图：`--spaces 78
+  --space-rows '131072*32'` 在 656 B 行下是 200 GiB 锁页内存（256/512/1024 B 分别是
+  78/156/312 GiB），需要 `ulimit -l` 放开，且分配/释放各几十秒。脚本在分配前用
+  `SC_PHYS_PAGES` 拦截明显不够的情况；`--dry-run` 只打印规划不分配。
+- 每个分区只给「行表点到的那几行」填随机数据（196608 行 = 123 MiB），其余是未初始化内存。
+  校验读的是同一块 host 内存，所以 `--verify` 仍然逐字节严格；被填的行数决定了 setup 时间，
+  `--rotate N` 会把被填的行集合并集放大到 N × 196608 行。
+- `--sweep row-bytes`（或任何会改变行长/行数的 sweep）每个点都重新分配整个池，78 分区下
+  四个点就是四轮 200 GiB 级别的 malloc + 锁页 + 释放。
 - `--cores` 超过实际 AIV 数时会在 tiling 里被截断，标签仍显示请求值。
 - `--src host` 依赖 `get_npu_view_from_cpu_tensor`（`aclrtHostGetDevicePointer` 的映射视图）。
   **开关是 `PYTORCH_NPU_ALLOC_CONF=pinned_mem_register:True`**：torch_npu 的 pinned 分配器

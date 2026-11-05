@@ -67,6 +67,20 @@ Examples:
     python benchmarks/kernel/scatter_copy_ub_bench.py --rows 4096 --ckv-dim 656 \
         --kpe-dim 0 --dtype uint8 --src host --sweep rows
 
+    # the production shape: 78 DDR partitions of 131072 x 32 rows, 196608 rows
+    # copied out of every one per pass (topk 2048 x mtp 3 x 32 requests), 78
+    # launches per pass over 200 GiB of DDR. --dry-run first: it prints the
+    # allocation plan and exits without taking the memory.
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --spaces 78 \
+        --space-rows '131072*32' --ckv-dim 656 --kpe-dim 0 --dtype uint8 \
+        --src host --dry-run
+
+    # same shape at the four row lengths the cache uses (the pool is reallocated
+    # per point, so this is four sequential 78-pass setups)
+    python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --spaces 78 \
+        --space-rows '131072*32' --kpe-dim 0 --dtype uint8 --src host \
+        --sweep row-bytes
+
 Two separate products must exist before the first run, from the repository
 root::
 
@@ -117,6 +131,12 @@ OP_NAME = "scatter_copy_ub_bench"
 # quantised MLA row, for instance) is measured through uint8: the op moves bytes
 # and never interprets them, so no fp8 dtype has to exist on the part.
 DTYPES = {"bf16": (torch.bfloat16, 2), "fp16": (torch.float16, 2), "uint8": (torch.uint8, 1)}
+# Above this many elements a source pool is allocated but only the rows a table
+# points at are given payload. The copy never reads the rest, and the verifier
+# reads the same host bytes, so filling 205 GiB of DDR would cost minutes per
+# space and buy nothing. Below it, filling everything keeps the mismatch report
+# able to say "the destination holds source row N instead of row M".
+FULL_FILL_ELEMS = 32 << 20
 # ``torch.pin_memory()`` only locks pages; it does not publish the range to the
 # device. ``aclrtHostRegisterV2`` does, and the payload is then aligned to this
 # boundary -- engram/npu.py aligns to 64 KiB because unaligned device reads of a
@@ -425,6 +445,24 @@ def _load_runtime():
     _warn_if_kernel_package_missing()
 
 
+def _count(text: str) -> int:
+    """Row/token count, allowing the multiplicative form used in production.
+
+    ``--space-rows '131072*32'`` is 4194304 rows and keeps the shape readable:
+    32 requests x 128K tokens. Quote it, or the shell will expand the ``*``.
+    Underscores are ignored, so ``1_048_576`` works too.
+    """
+    try:
+        total = 1
+        for part in text.replace("_", "").split("*"):
+            total *= int(part)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a count: {text!r}") from None
+    if total <= 0:
+        raise argparse.ArgumentTypeError(f"count must be positive: {text!r}")
+    return total
+
+
 def _parse_device(text: str) -> int:
     """``3`` and ``npu:3`` both mean "the fourth visible NPU"."""
     value = text.strip().lower()
@@ -615,11 +653,42 @@ class Case:
     # Distinct source tables to rotate through, one per launch (0/1 = reuse the
     # same 4096 rows every launch, which keeps the page tables warm).
     rotate: int = 0
+    # Independent source regions polled in round-robin, one launch each. The
+    # production shape is 78 of them (78 paged-cache partitions), each holding
+    # 131072 x 32 rows, and every step copies 196608 rows out of every one, so a
+    # full pass reads 78 x 123 MiB = 9.6 GiB spread over 205 GiB of DDR. A single
+    # big pool cannot reproduce that: the address span between one space's rows
+    # and the next one's is what the walk actually sees.
+    spaces: int = 1
+    # Rows per space. 0 -> pool_rows (and, if that is 0 too, rows).
+    space_rows: int = 0
+    # Write every space's result over the same destination window. Off by
+    # default: production concatenates the 78 gathers into 9.6 GiB of HBM, and
+    # overlapping writes would hide that traffic in the caches.
+    dst_shared: bool = False
+    # Destination rows allocated per copied row (the scatter is spread over this
+    # many slots so it is not a disguised sequential write). 0 = auto: 4 for one
+    # space, 1 for many, because 78 x 196608 rows x 4 x 656 B is 37 GiB of HBM
+    # for a 9.4 GiB payload.
+    dst_slack: int = 0
+
+    def __post_init__(self) -> None:
+        if self.dst_slack <= 0:
+            self.dst_slack = 1 if self.spaces > 1 else 4
+        if self.dst_slack < 1:
+            raise ValueError("dst_slack must be >= 1")
 
     @property
     def src_total(self) -> int:
-        """Rows in the source tensor (never smaller than the copy count)."""
+        """Rows in *one* source region (never smaller than the copy count)."""
+        if self.space_rows > 0:
+            return self.space_rows
         return self.pool_rows if self.pool_rows > 0 else self.rows
+
+    @property
+    def total_pool_bytes(self) -> int:
+        """Bytes of source memory this case allocates, across all spaces."""
+        return self.spaces * self.src_total * self.row_bytes
 
     @property
     def copy_rope(self) -> bool:
@@ -651,6 +720,7 @@ class Bench:
         gen = torch.Generator().manual_seed(seed)
         rows = case.rows
         pool = case.src_total
+        spaces = case.spaces
 
         # Sparse topk selection is a random gather from DRAM into a random slot,
         # so both tables are full permutations. Destinations are spread over 4x
@@ -664,28 +734,57 @@ class Bench:
         # --rotate N pre-builds N source tables and hands the kernel a different
         # one for every launch, at zero cost (the table is already on the device,
         # so run() only picks a different slice). Without it every launch re-reads
-        # the same 4096 rows, so the IOMMU/page tables stay warm and a large pool
+        # the same rows, so the IOMMU/page tables stay warm and a large pool
         # looks cheaper than it is in production, where each step selects
         # different rows.
+        #
+        # --spaces N multiplies the source into N independent regions that are
+        # polled one launch at a time, and gives every region its own table set.
+        # The tables are all uploaded up front: 78 spaces x 196608 rows x 4 B is
+        # 58 MiB of HBM, and slicing is free, so switching space inside the timed
+        # loop costs nothing (spaces>1 only cycles the space index, not a copy).
         n_tables = max(1, case.rotate)
-        tables = torch.stack(
-            [_run_table(pool, rows, case.run_len, gen) for _ in range(n_tables)]
+        tables = torch.cat(
+            [
+                torch.stack([_run_table(pool, rows, case.run_len, gen) for _ in range(n_tables)])
+                for _ in range(spaces)
+            ]
         ).to(torch.int32)
-        self.dst_rows = _run_table(rows * 4, rows, case.run_len, gen).to(torch.int32)
+        self.dst_rows = _run_table(rows * case.dst_slack, rows, case.run_len, gen).to(torch.int32)
 
-        self.src_kv_dev, self.src_kv_cpu = self._make_source(pool, case.ckv_dim, gen)
-        self.dst_kv = torch.zeros(rows * 4, case.ckv_dim, dtype=case.dtype, device=self.device)
+        # Only the rows a table points at are ever read, so a pool too large to
+        # fill is left uninitialised elsewhere: allocating 205 GiB is affordable,
+        # writing 205 GiB of random payload per space is not.
+        self._src_kv: list[torch.Tensor] = []
+        self._src_kv_cpu: list[torch.Tensor | None] = []
+        for s in range(spaces):
+            touched = torch.unique(tables[s * n_tables : (s + 1) * n_tables].reshape(-1).long())
+            dev, cpu = self._make_source(pool, case.ckv_dim, gen, touched)
+            self._src_kv.append(dev)
+            self._src_kv_cpu.append(cpu)
+
+        dst_rows_per_space = rows * case.dst_slack
+        n_dst = dst_rows_per_space if case.dst_shared else dst_rows_per_space * spaces
+        self.dst_kv = torch.zeros(n_dst, case.ckv_dim, dtype=case.dtype, device=self.device)
         if case.copy_rope:
-            self.src_rope_dev, self.src_rope_cpu = self._make_source(pool, case.kpe_dim, gen)
-            self.dst_rope = torch.zeros(rows * 4, case.kpe_dim, dtype=case.dtype, device=self.device)
+            self._src_rope: list[torch.Tensor] = []
+            self._src_rope_cpu: list[torch.Tensor | None] = []
+            for s in range(spaces):
+                touched = torch.unique(
+                    tables[s * n_tables : (s + 1) * n_tables].reshape(-1).long()
+                )
+                dev, cpu = self._make_source(pool, case.kpe_dim, gen, touched)
+                self._src_rope.append(dev)
+                self._src_rope_cpu.append(cpu)
+            self.dst_rope = torch.zeros(n_dst, case.kpe_dim, dtype=case.dtype, device=self.device)
         else:
             # copy_rope=0: the rope tensors are still required by the op schema
             # but the kernel never touches them, so a one-element placeholder on
             # the right device is all it takes. A [rows, 0] tensor would be the
             # semantically cleaner argument, but zero-sized inputs are rejected
             # by some graph paths.
-            self.src_rope_dev = torch.zeros(1, 1, dtype=case.dtype, device=self.device)
-            self.src_rope_cpu = None
+            self._src_rope = [torch.zeros(1, 1, dtype=case.dtype, device=self.device)] * spaces
+            self._src_rope_cpu = [None] * spaces
             self.dst_rope = torch.zeros(1, 1, dtype=case.dtype, device=self.device)
 
         if case.table_mode == 0:
@@ -695,10 +794,12 @@ class Bench:
             # touches rows 0..rows-1 only: --src-rows changes the allocated pool
             # but not what this mode addresses, so it cannot show a working-set
             # effect. main() warns about that combination.
-            tables = torch.arange(rows, dtype=torch.int32).reshape(1, rows)
+            tables = torch.arange(rows, dtype=torch.int32).reshape(1, rows).repeat(spaces, 1)
+            n_tables = 1
             self.dst_rows = torch.arange(rows, dtype=torch.int32)
 
-        self.n_tables = tables.shape[0]
+        # Per-space table count, and the flat index run() advances through.
+        self.n_tables = n_tables
         self.src_tables_cpu = tables
         # The first table, for interactive use; run() is what advances the index
         # and verify() reads src_tables_cpu[self._last_table] instead.
@@ -706,21 +807,78 @@ class Bench:
         self.src_tables_dev = tables.to(self.device)
         # Pre-sliced views: run() must not create a tensor view per launch, that
         # alone would cost ~1 us inside a 80 us measurement.
-        self._table_views = [self.src_tables_dev[i] for i in range(self.n_tables)]
+        self._table_views = [self.src_tables_dev[i] for i in range(tables.shape[0])]
+        # Same for the per-space source and destination slices.
+        self._src_kv_views = list(self._src_kv)
+        self._src_rope_views = list(self._src_rope)
+        if case.dst_shared:
+            self._dst_kv_views = [self.dst_kv] * spaces
+            self._dst_rope_views = [self.dst_rope] * spaces
+        else:
+            self._dst_kv_views = [
+                self.dst_kv[s * dst_rows_per_space : (s + 1) * dst_rows_per_space]
+                for s in range(spaces)
+            ]
+            self._dst_rope_views = (
+                [
+                    self.dst_rope[s * dst_rows_per_space : (s + 1) * dst_rows_per_space]
+                    for s in range(spaces)
+                ]
+                if case.copy_rope
+                else [self.dst_rope] * spaces
+            )
+        self._space = 0
         self._table = 0
+        self._last_space = 0
         self._last_table = 0
         self.dst_rows_dev = self.dst_rows.to(self.device)
 
-    def _make_source(self, pool: int, dim: int, gen: torch.Generator):
-        """Source tensor of ``pool`` rows; only ``case.rows`` of them are read."""
-        values = _random_values(pool, dim, self.case.dtype, gen)
+    # The single-space names keep working for callers that only ever look at
+    # space 0 (verify, interactive pokes); run() is the one that cycles.
+    @property
+    def src_kv_dev(self) -> torch.Tensor:
+        return self._src_kv[0]
+
+    @property
+    def src_kv_cpu(self) -> torch.Tensor | None:
+        return self._src_kv_cpu[0]
+
+    @property
+    def src_rope_dev(self) -> torch.Tensor:
+        return self._src_rope[0]
+
+    @property
+    def src_rope_cpu(self) -> torch.Tensor | None:
+        return self._src_rope_cpu[0]
+
+    def _make_source(self, pool: int, dim: int, gen: torch.Generator, touched: torch.Tensor | None):
+        """One source region of ``pool`` rows; only ``touched`` rows get payload.
+
+        ``touched=None`` fills everything (small pools, best diagnostics). A
+        large pool is allocated but left uninitialised outside ``touched``,
+        because the copy never reads those rows and the reference check reads
+        the very same host bytes -- so the comparison stays exact without
+        writing tens of GiB of random data per space.
+        """
+        values = None
+        if touched is None or pool * dim <= FULL_FILL_ELEMS:
+            values = _random_values(pool, dim, self.case.dtype, gen)
+            touched = None
         if self.case.src == "npu":
-            return values.to(self.device), None
+            if touched is None:
+                return values.to(self.device), None
+            big = torch.empty(pool, dim, dtype=self.case.dtype, device=self.device)
+            big.index_copy_(
+                0,
+                touched.to(self.device),
+                _random_values(int(touched.numel()), dim, self.case.dtype, gen),
+            )
+            return big, None
         if self.case.src != "host":
             raise ValueError(f"unknown source placement: {self.case.src}")
-        return self._publish_host_source(values, pool, dim)
+        return self._publish_host_source(values, pool, dim, gen, touched)
 
-    def _publish_host_source(self, values: torch.Tensor, rows: int, dim: int):
+    def _publish_host_source(self, values, rows: int, dim: int, gen, touched):
         """Return (device view, host copy) of a host buffer the NPU can read.
 
         Two things are needed and only the second one is optional:
@@ -738,7 +896,7 @@ class Bench:
         imported before this script ran) the range is registered here instead,
         mirroring HostUvaBuffer.
         """
-        elt = values.element_size()
+        elt = _elem_size(self.case.dtype)
         # Over-allocate so the payload starts on a 64 KiB boundary. The whole
         # storage is registered, so the view's storage_offset stays reachable and
         # aclrtHostGetDevicePointer(storage base) remains valid.
@@ -752,7 +910,15 @@ class Bench:
             )
         offset = ((-raw.data_ptr()) % HOST_ALIGN_BYTES) // elt
         payload = raw.narrow(0, offset, rows * dim).view(rows, dim)
-        payload.copy_(values)
+        if values is not None:
+            payload.copy_(values)
+        else:
+            # Large pool: only the rows a table points at carry payload. Writing
+            # all 205 GiB per space would dominate the setup and tell the copy
+            # nothing -- it reads nothing else.
+            payload[touched] = _random_values(
+                int(touched.numel()), dim, self.case.dtype, gen
+            )
 
         view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(payload)
         if view is not None:
@@ -810,26 +976,59 @@ class Bench:
                 print(f"warning: aclrtHostUnregister rc={rc} for 0x{base:x}", flush=True)
         self._host_regions.clear()
 
-    def run(self) -> None:
-        # Picking a different pre-staged table costs nothing (no copy, no host
-        # round trip), so a rotating table inside the timed loop is free.
-        table = self._table_views[self._table]
+    def launch(self, space: int, table: int | None = None) -> None:
+        """One launch on one space, with an explicit table slot.
+
+        Everything is pre-sliced, so this is: three list indexes, one op call.
+        """
+        t = self._table if table is None else table
         torch.ops._C_ascend.scatter_copy_ub_bench(
-            self.src_kv_dev,
-            self.src_rope_dev,
-            table,
+            self._src_kv_views[space],
+            self._src_rope_views[space],
+            self._table_views[space * self.n_tables + t],
             self.dst_rows_dev,
-            self.dst_kv,
-            self.dst_rope,
+            self._dst_kv_views[space],
+            self._dst_rope_views[space],
             self.case.bank,
             self.case.group_rows,
             self.case.table_mode,
             self.case.cores,
             int(self.case.copy_rope),
         )
-        self._last_table = self._table
-        if self.n_tables > 1:
+        self._last_space = space
+        self._last_table = space * self.n_tables + t
+
+    def run(self) -> None:
+        # Picking a different pre-staged table or a different pre-published
+        # source costs nothing (no copy, no host round trip), so cycling both
+        # inside the timed loop is free. With --spaces N every launch moves to
+        # the next region and every full pass moves to the next table, which is
+        # the production pattern: one gather per partition per step.
+        self.launch(self._space)
+        if self.case.spaces > 1:
+            self._space = (self._space + 1) % self.case.spaces
+            if self._space == 0 and self.n_tables > 1:
+                self._table = (self._table + 1) % self.n_tables
+        elif self.n_tables > 1:
             self._table = (self._table + 1) % self.n_tables
+
+    def time_spaces(self) -> list[float]:
+        """Per-space latency (us) of one pass, in space order.
+
+        Worth one pass of extra work: a mean hides the case where one region is
+        slow (NUMA placement, a different page-table walk depth), and that is
+        exactly what --spaces is there to expose.
+        """
+        out: list[float] = []
+        for s in range(self.case.spaces):
+            start = torch.npu.Event(enable_timing=True)
+            end = torch.npu.Event(enable_timing=True)
+            start.record()
+            self.launch(s)
+            end.record()
+            torch.npu.synchronize()
+            out.append(start.elapsed_time(end) * 1000.0)
+        return out
 
     def verify(self, sample: int = 64, repeats: int = 1) -> None:
         """Compare the copied rows against the source, and report *how* they differ.
@@ -842,18 +1041,32 @@ class Bench:
 
         With ``kpe_dim == 0`` the rope plane is never written, so only the CKV
         plane is checked; the placeholder rope tensors hold no reference data.
+
+        Every space is checked against its own source and its own table, because
+        --spaces makes them independent: a wrong base pointer would otherwise
+        pass as long as space 0 happens to be right.
         """
+        for space in range(self.case.spaces):
+            self._verify_space(space, sample, repeats)
+
+    def _verify_space(self, space: int, sample: int, repeats: int) -> None:
         total = self.case.rows
+        # Checking every row of 78 x 196608 rows means 9.6 GiB of host reads and
+        # a 78-way tensor compare; keep the default sample, it is already more
+        # than the 64-row default and covers each space's own address base.
         sample = total if sample <= 0 else min(sample, total)
         idx = torch.arange(sample, dtype=torch.int64)
-        src_flat = _comparable(self._source_cpu(self.src_kv_cpu, self.src_kv_dev))
+        src_flat = _comparable(self._source_cpu(self._src_kv_cpu[space], self._src_kv[space]))
+        dst_flat = self._dst_kv_views[space]
         dst_idx = self.dst_rows[idx].to(torch.int64)
         check_rope = self.case.copy_rope
         if check_rope:
-            rope_flat = _comparable(self._source_cpu(self.src_rope_cpu, self.src_rope_dev))
+            rope_flat = _comparable(
+                self._source_cpu(self._src_rope_cpu[space], self._src_rope[space])
+            )
 
         for attempt in range(repeats):
-            self.run()
+            self.launch(space)
             torch.npu.synchronize()
             # The table this launch used: with --rotate the rows differ per
             # launch, so the reference has to be rebuilt from the same table.
@@ -861,10 +1074,10 @@ class Bench:
             want_kv = src_flat[used[idx].to(torch.int64)]
             if check_rope:
                 want_rope = rope_flat[used[idx].to(torch.int64)]
-            got_kv = _comparable(self.dst_kv[dst_idx].cpu())
+            got_kv = _comparable(dst_flat[dst_idx].cpu())
             bad_kv = (got_kv != want_kv).any(dim=1)
             if check_rope:
-                got_rope = _comparable(self.dst_rope[dst_idx].cpu())
+                got_rope = _comparable(self._dst_rope_views[space][dst_idx].cpu())
                 bad_rope = (got_rope != want_rope).any(dim=1)
             else:
                 got_rope = want_rope = None
@@ -872,22 +1085,24 @@ class Bench:
             if bool(bad_kv.any()) or bool(bad_rope.any()):
                 summary = self._report_mismatch(
                     attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
-                    src_flat, used
+                    src_flat, used, space
                 )
                 raise AssertionError(
-                    f"scatter_copy_ub_bench verify failed on attempt {attempt + 1}/{repeats}: {summary}"
+                    f"scatter_copy_ub_bench verify failed on space {space} attempt "
+                    f"{attempt + 1}/{repeats}: {summary}"
                 )
             print(
-                f"verify: attempt {attempt + 1}/{repeats} ok ({sample}/{total} rows, "
+                f"verify: attempt {attempt + 1}/{repeats} ok (space {space + 1}/{self.case.spaces}, "
+                f"{sample}/{total} rows, "
                 f"{self.case.ckv_dim}+{self.case.kpe_dim} elems x{self.case.elem_size}B, "
                 f"{self.case.bank} banks, group {self.case.group_rows}, table_mode {self.case.table_mode}"
-                + ("" if self.n_tables == 1 else f", table {self._last_table + 1}/{self.n_tables}")
+                + ("" if self.n_tables == 1 else f", table {self._table + 1}/{self.n_tables}")
                 + ")",
                 flush=True,
             )
 
     def _report_mismatch(self, attempt, repeats, bad_kv, bad_rope, got_kv, want_kv, got_rope, want_rope,
-                         src_flat, used) -> str:
+                         src_flat, used, space=0) -> str:
         """Print one block per bad row and return a one-line summary.
 
         The summary is also embedded in the raised AssertionError, so the
@@ -897,7 +1112,8 @@ class Bench:
         total_kv = int((got_kv != want_kv).sum())
         total_rope = int((got_rope != want_rope).sum()) if got_rope is not None else 0
         print(
-            f"\nverify: attempt {attempt + 1}/{repeats} mismatched {len(rows)}/{got_kv.shape[0]} sampled rows "
+            f"\nverify: space {space} attempt {attempt + 1}/{repeats} mismatched "
+            f"{len(rows)}/{got_kv.shape[0]} sampled rows "
             f"(kv {total_kv} elems, rope {total_rope} elems; first rows {rows[:8]})",
             flush=True,
         )
@@ -969,15 +1185,57 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=int,
         default=2048,
         help="token rows to copy per launch (the gather count); the source tensor may be "
-        "larger, see --src-rows",
+        "larger, see --src-rows. 196608 is topk 2048 x mtp 3 x 32 requests",
     )
     parser.add_argument(
         "--src-rows",
-        type=int,
+        type=_count,
         default=0,
         help="rows allocated in the source (the gather pool), default = --rows. Use "
         "131072 with --rows 4096 to measure a real KV cache shape: the copy then "
-        "walks a working set far bigger than the payload it moves",
+        "walks a working set far bigger than the payload it moves. Accepts a product, "
+        "e.g. '131072*32'",
+    )
+    parser.add_argument(
+        "--spaces",
+        type=_count,
+        default=1,
+        metavar="N",
+        help="independent source regions, polled one launch at a time (1 = a single "
+        "pool, the old behaviour). The production shape is 78 cache partitions, each "
+        "holding --space-rows rows, with --rows copied out of every one per pass, so "
+        "a pass reads N x rows across a span N times larger than one region",
+    )
+    parser.add_argument(
+        "--space-rows",
+        type=_count,
+        default=0,
+        metavar="R",
+        help="rows per space (default: --src-rows, else --rows). The production space "
+        "is '131072*32' = 4194304 rows, i.e. 32 requests x 128K tokens",
+    )
+    parser.add_argument(
+        "--dst-shared",
+        action="store_true",
+        help="write every space's result into the same destination window. Off by "
+        "default: production concatenates the per-space gathers, and overlapping "
+        "writes into one 492 MiB window would be served by the caches",
+    )
+    parser.add_argument(
+        "--dst-slack",
+        type=int,
+        default=0,
+        metavar="N",
+        help="destination rows per copied row (0 = auto: 4 with one space, 1 with "
+        "--spaces > 1). The slack makes the scatter a scatter instead of a sequential "
+        "write, but N x --spaces multiplies HBM: 78 x 196608 x 4 x 656 B is 37 GiB "
+        "for a 9.4 GiB payload",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the allocation plan (bytes per space, total DDR, table size) and "
+        "exit without allocating -- check this before a 200 GiB run",
     )
     parser.add_argument(
         "--ckv-dim",
@@ -1070,7 +1328,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--sweep",
-        choices=("none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim", "src-rows", "rows"),
+        choices=(
+            "none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim",
+            "row-bytes", "src-rows", "rows",
+        ),
         default="none",
         help="iterate one knob instead of measuring a single point",
     )
@@ -1089,6 +1350,11 @@ def sweep_values(name: str) -> list:
         # 16 scale + 128 rope, and the same row padded to 32 B). Comparing the
         # three groups is what tells a length penalty from an alignment one.
         "ckv-dim": [384, 512, 576, 640, 656, 672, 704, 768, 896, 1024],
+        # The four row lengths the cache actually uses, expressed in bytes rather
+        # than elements so the sweep reads as the layout discussion does. Every
+        # one is a whole number of granules except 656, which is 768 + a 144 B
+        # tail: 256 and 512 are the clean controls, 1024 the 4-granule one.
+        "row-bytes": [256, 512, 656, 1024],
         # Rows per launch. A launch carries a fixed cost (dispatch + tiling lookup,
         # a few us), so a small --rows reports a low GB/s for the same row length:
         # 512 B rows measure 41.2 GB/s at 2048 rows and 44.4 at 4096. Fit
@@ -1124,15 +1390,25 @@ def main(argv=None) -> int:
         raise SystemExit("--ckv-dim must be > 0 and --kpe-dim must be >= 0")
     if args.rotate < 0:
         raise SystemExit("--rotate must be >= 0")
+    if args.spaces < 1:
+        raise SystemExit("--spaces must be >= 1")
+    # One region's size: --space-rows wins, then --src-rows, then --rows.
+    space_rows = args.space_rows or args.src_rows or args.rows
+    if space_rows < args.rows:
+        raise SystemExit(
+            f"the source region holds {space_rows} rows but --rows asks for "
+            f"{args.rows}; one region must cover a single launch's copy count"
+        )
     if args.src_rows and args.src_rows < args.rows:
         raise SystemExit(
             f"--src-rows ({args.src_rows}) is the size of the source pool and must be "
             f">= --rows ({args.rows}); lower --rows instead if you want a smaller copy"
         )
-    if args.src_rows and args.table_mode == 0:
+    if (args.src_rows or args.space_rows) and args.table_mode == 0:
         print(
-            "note: --table-mode 0 addresses rows 0..rows-1 only, so --src-rows cannot "
-            "change the working set; use --table-mode 1 to measure the big pool",
+            "note: --table-mode 0 addresses rows 0..rows-1 only, so neither --src-rows "
+            "nor --space-rows can change the working set; use --table-mode 1 to measure "
+            "the big pool",
             file=sys.stderr,
             flush=True,
         )
@@ -1151,6 +1427,10 @@ def main(argv=None) -> int:
         run_len=args.run_len,
         pool_rows=args.src_rows,
         rotate=args.rotate,
+        spaces=args.spaces,
+        space_rows=space_rows if (args.space_rows or args.spaces > 1) else 0,
+        dst_shared=args.dst_shared,
+        dst_slack=args.dst_slack,
     )
     row_bytes = base.row_bytes
     print(
@@ -1170,6 +1450,45 @@ def main(argv=None) -> int:
             file=sys.stderr,
             flush=True,
         )
+    elif base.spaces > 1:
+        per_space_bytes = base.src_total * row_bytes
+        dst_rows_total = base.rows * base.dst_slack * (1 if base.dst_shared else base.spaces)
+        dst_bytes = dst_rows_total * row_bytes
+        pass_rows = base.spaces * base.rows
+        print(
+            f"spaces: {base.spaces} x {base.src_total} rows, {per_space_bytes / 2**30:.2f} GiB "
+            f"{'DDR' if base.src == 'host' else 'HBM'} per space, "
+            f"{base.total_pool_bytes / 2**30:.1f} GiB total\n"
+            f"        {base.rows} rows copied from every space "
+            f"({100.0 * base.rows / base.src_total:.1f}% of a space, "
+            f"{base.rows * row_bytes / 2**20:.0f} MiB per launch)\n"
+            f"        one pass = {base.spaces} launches, {pass_rows} rows, "
+            f"{pass_rows * row_bytes / 2**30:.2f} GiB moved, "
+            f"dst {dst_bytes / 2**20:.0f} MiB"
+            + (" (shared window)" if base.dst_shared else "")
+            + f", tables {base.spaces * max(1, base.rotate) * base.rows * 4 / 2**20:.0f} MiB",
+            file=sys.stderr,
+            flush=True,
+        )
+        need = base.total_pool_bytes
+        try:
+            phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (ValueError, OSError, AttributeError):
+            phys = 0
+        if phys and need > 0.85 * phys:
+            raise SystemExit(
+                f"this case needs {need / 2**30:.0f} GiB of "
+                f"{'pinned host memory' if base.src == 'host' else 'HBM'} but the machine "
+                f"has {phys / 2**30:.0f} GiB; lower --spaces or --space-rows, or check "
+                "--dry-run first"
+            )
+        print(
+            "note: allocation is {:.0f} GiB, and only the rows each table points at are "
+            "given payload, so setup is a malloc plus one fill per space, not a full "
+            "rewrite".format(need / 2**30),
+            file=sys.stderr,
+            flush=True,
+        )
     elif base.src_total != base.rows:
         pool_bytes = base.src_total * row_bytes
         print(
@@ -1179,6 +1498,15 @@ def main(argv=None) -> int:
             file=sys.stderr,
             flush=True,
         )
+    if args.dry_run:
+        print(
+            f"dry-run: {base.spaces} space(s) x {base.src_total} rows x {row_bytes} B = "
+            f"{base.total_pool_bytes / 2**30:.2f} GiB source, "
+            f"{base.rows} rows copied per launch; nothing was allocated",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0
     print(dma_cost_hint(row_bytes, base.group_rows, base.rows), file=sys.stderr, flush=True)
     if base.src == "npu":
         print(
@@ -1201,9 +1529,30 @@ def main(argv=None) -> int:
         points.append(("baseline", base))
     else:
         for value in sweep_values(args.sweep):
+            if args.sweep == "row-bytes":
+                # The sweep is in bytes so the numbers match the layout argument.
+                # The op counts elements, and the KPE plane would add to the row,
+                # so this one forces a single plane.
+                if value % base.elem_size:
+                    raise SystemExit(
+                        f"row-bytes={value} is not a whole number of {base.elem_size} B "
+                        "elements; use --dtype uint8 for byte-exact row lengths"
+                    )
+                case = Case(
+                    **{**base.__dict__, "ckv_dim": value // base.elem_size, "kpe_dim": 0}
+                )
+                points.append((f"row-bytes={value}", case))
+                continue
             field = SWEEP_FIELDS.get(args.sweep, args.sweep.replace("-", "_"))
             case = Case(**{**base.__dict__, field: value})
             points.append((f"{args.sweep}={value}", case))
+    if args.sweep == "row-bytes" and base.kpe_dim > 0:
+        print(
+            "note: --sweep row-bytes measures the whole row in the CKV plane, so the "
+            "KPE plane is off for every point",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # --sweep rows changes the copy count but the pool is fixed at --src-rows, so
     # a point can ask for more rows than the pool has; the table build would then
@@ -1227,7 +1576,7 @@ def main(argv=None) -> int:
             flush=True,
         )
 
-    header = f"{'case':>18} {'rows':>7} {'pool':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
+    header = f"{'case':>18} {'rows':>7} {'spc':>3} {'pool':>7} {'B/row':>6} {'group':>5} {'bank':>4} {'tbl':>3} {'cores':>5} "
     header += f"{'us':>9} {'ns/row':>7} {'GB/s':>8} {'%host':>5}"
     print(header)
     print("-" * len(header))
@@ -1238,6 +1587,14 @@ def main(argv=None) -> int:
                 bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
             us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
             gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
+            # One pass = every space once. A single pass is also the only place
+            # the spread between spaces shows up, and a 78-way mean would hide a
+            # region that is slow for a reason of its own (NUMA placement, a
+            # deeper page-table walk). Two passes: the first warms the walk.
+            per_space: list[float] = []
+            if case.spaces > 1:
+                bench.time_spaces()
+                per_space = bench.time_spaces()
             if args.json:
                 # One record per point on stdout, nothing else, so a driver script
                 # (host_link_scale.py) can aggregate several processes.
@@ -1249,6 +1606,10 @@ def main(argv=None) -> int:
                             "device": case.device,
                             "rows": case.rows,
                             "src_rows": case.src_total,
+                            "spaces": case.spaces,
+                            "space_rows": case.src_total,
+                            "total_pool_bytes": case.total_pool_bytes,
+                            "dst_shared": case.dst_shared,
                             "pool_bytes": case.src_total * case.row_bytes,
                             "row_bytes": case.row_bytes,
                             "dtype": args.dtype,
@@ -1264,6 +1625,9 @@ def main(argv=None) -> int:
                             "us_median": us_med,
                             "ns_per_row": us_min * 1000.0 / case.rows,
                             "gbps": gbps,
+                            "pass_us": us_min * case.spaces,
+                            "space_us_min": min(per_space) if per_space else None,
+                            "space_us_max": max(per_space) if per_space else None,
                             "host_model_gbps": predict_gbps(
                                 case.row_bytes, case.group_rows, case.rows
                             ),
@@ -1281,13 +1645,21 @@ def main(argv=None) -> int:
                 # means the source is not crossing the host link (--src npu).
                 model = predict_gbps(case.row_bytes, case.group_rows, case.rows)
                 print(
-                    f"{label:>18} {case.rows:>7} {case.src_total:>7} {case.row_bytes:>6} {case.group_rows:>5} "
+                    f"{label:>18} {case.rows:>7} {case.spaces:>3} {case.src_total:>7} "
+                    f"{case.row_bytes:>6} {case.group_rows:>5} "
                     f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
                     f"{us_min:>9.1f} {us_min * 1000.0 / case.rows:>7.1f} {gbps:>8.1f} "
                     f"{100.0 * gbps / model:>5.0f}"
                 )
                 if us_med != us_min:
                     print(f"{'':>18} median {us_med:.1f} us")
+                if per_space:
+                    lo, hi = min(per_space), max(per_space)
+                    print(
+                        f"{'':>18} pass {case.spaces} x {us_min:.1f} us = "
+                        f"{us_min * case.spaces / 1000.0:.2f} ms; per-space "
+                        f"{lo:.1f}..{hi:.1f} us (max/min {hi / lo:.3f})"
+                    )
         finally:
             # Host sources stay registered (and the device may still be reading
             # them) until every launch has retired.
