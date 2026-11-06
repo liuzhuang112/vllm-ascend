@@ -157,6 +157,10 @@ FULL_FILL_ELEMS = 32 << 20
 # boundary -- engram/npu.py aligns to 64 KiB because unaligned device reads of a
 # host range were observed to return wrong data on A3 / CANN 9.2.
 HOST_ALIGN_BYTES = 64 * 1024
+# One allocation per this many bytes while imitating a sweep's memory history
+# (--churn-gib). 1 GiB keeps the number of live allocations small enough that the
+# pinned allocator itself does not become the thing being measured.
+CHURN_CHUNK_BYTES = 1 << 30
 ACL_HOST_REG_MAPPED = 0x2
 ACL_HOST_REG_PINNED = 0x10000000
 # torch_npu's pinned allocator only maps its pages into the device address space
@@ -702,6 +706,12 @@ class Case:
     # space, 1 for many, because 78 x 196608 rows x 4 x 656 B is 37 GiB of HBM
     # for a 9.4 GiB payload.
     dst_slack: int = 0
+    # GiB of pinned host memory to allocate and release before this point is set
+    # up. Not part of the copy at all: it reproduces the pinned-arena history of
+    # a long sweep, which is the only thing that separates a 34.4 GB/s lone run
+    # from the same flags reading 28 GB/s at rung 17. Only meaningful with
+    # --isolate-points, where each point starts from a fresh process.
+    churn_gib: int = 0
 
     def __post_init__(self) -> None:
         if self.dst_slack <= 0:
@@ -1369,7 +1379,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--sweep",
         choices=(
             "none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim",
-            "row-bytes", "src-rows", "rows", "spaces", "dst-slack", "grid",
+            "row-bytes", "src-rows", "rows", "spaces", "dst-slack", "churn", "grid",
         ),
         default="none",
         help="iterate one knob instead of measuring a single point; 'grid' is the "
@@ -1382,11 +1392,30 @@ def parse_args(argv=None) -> argparse.Namespace:
         "put the production row in the same matrix",
     )
     parser.add_argument(
+        "--sweep-values",
+        default="",
+        help="replace this run's ladder, comma separated: '--sweep grid "
+        "--sweep-values 1' measures the row-length ladder with no space ladder, "
+        "'--sweep churn --sweep-values 0,48,96' is a three-point dose-response. "
+        "Applies to --sweep grid (the values are space counts) or to the named sweep",
+    )
+    parser.add_argument(
         "--xlsx",
         default="",
         help="write every measured point to this .xlsx workbook: one row per point, "
         "plus a GB/s matrix and a pass-time matrix when the sweep covers two "
         "dimensions. Needs openpyxl; without it a .csv of the same rows is written",
+    )
+    parser.add_argument(
+        "--churn-gib",
+        type=int,
+        default=0,
+        metavar="GiB",
+        help="allocate and release this much pinned host memory before setting the "
+        "point up. The same 656 B copy reads 34.4 GB/s in a fresh process and "
+        "27.9-28.5 GB/s as a rung of a long sweep with every flag identical; this "
+        "reproduces that history on purpose instead of inheriting it. Use with "
+        "--sweep churn --isolate-points for a dose-response",
     )
     parser.add_argument(
         "--isolate-points",
@@ -1408,7 +1437,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+# --sweep-values replaces one ladder for this run: "--sweep grid --sweep-values 1"
+# is "the row-length ladder only, no space ladder" (7 points instead of 56), and
+# "--sweep churn --sweep-values 0,48,96" is a three-point dose-response.
+_SWEEP_OVERRIDES: dict[str, list] = {}
+
+
 def sweep_values(name: str) -> list:
+    if name in _SWEEP_OVERRIDES:
+        return _SWEEP_OVERRIDES[name]
     return {
         "group-rows": [1, 2, 4, 8],
         "bank": [1, 2, 3, 4, 6, 8],
@@ -1448,6 +1485,12 @@ def sweep_values(name: str) -> list:
         # the count while the payload per launch does not -- that is what makes
         # this the measurement of "does the address span cost anything".
         "spaces": [1, 2, 4, 8, 16, 32, 64, 78],
+        # How much pinned host memory the process has been through before this
+        # point is set up. A ladder rung inherits its predecessor's freed arena;
+        # a lone run does not. Sweeping this in isolated processes separates
+        # "the copy got slower" from "the process got older" -- the two readings
+        # that have to be told apart before either number means anything.
+        "churn": [0, 8, 32, 96, 192],
     }[name]
 
 
@@ -1459,7 +1502,7 @@ GRID_ROW_BYTES = (256, 512, 1024)
 
 # A sweep name is normally the field name with dashes flattened; --src-rows is
 # the source pool, which lives in Case.pool_rows.
-SWEEP_FIELDS = {"src-rows": "pool_rows"}
+SWEEP_FIELDS = {"src-rows": "pool_rows", "churn": "churn_gib"}
 
 
 def _numa_profile(ptr: int, size: int) -> str:
@@ -1538,10 +1581,95 @@ def _guard_memory(case: Case) -> None:
         )
 
 
+def _churn_bytes(total: int) -> int:
+    """Allocate, fault in, and release ``total`` bytes of pinned host memory.
+
+    Returns the bytes actually churned: 200 GiB is not always available, and the
+    number is part of the reading ("churned 96 GiB, not 192").
+
+    The page faulting is the point. An allocation nobody writes to is free pages,
+    so it changes nothing; what the next allocation gets depends on how much
+    *resident* memory was just handed back to the kernel.
+    """
+    if total <= 0:
+        return 0
+    page = 1 << 12
+    held: list[torch.Tensor] = []
+    done = 0
+    try:
+        while done < total:
+            # The last chunk is trimmed, so a caller that asks for 3.25 GiB gets
+            # 3.25 GiB and not a rounded-up 4.
+            chunk = min(CHURN_CHUNK_BYTES, total - done)
+            try:
+                buf = torch.empty(chunk, dtype=torch.uint8, pin_memory=True)
+            except RuntimeError as exc:
+                print(
+                    f"note: --churn-gib stopped at {done / 2**30:.0f} GiB ({exc})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                break
+            if not buf.is_pinned():
+                raise SystemExit(
+                    "--churn-gib needs the torch_npu pinned allocator; pin_memory() "
+                    "returned an ordinary CPU buffer"
+                )
+            # One byte per 4 KiB makes every page distinct; the rest of the page
+            # follows as the kernel copies the page in.
+            buf.view(chunk // page, page)[:, 0] = 1
+            held.append(buf)
+            done += chunk
+    finally:
+        del held
+        gc.collect()
+    return done
+
+
+def _churn_host(gib: int) -> None:
+    """Reproduce the pinned-arena history of point N before measuring point N.
+
+    This is the one difference between a lone run and the same flags measured as
+    rung 17 of a matrix, made explicit. A ladder keeps one interpreter alive, so
+    each point carves its pinned source out of what the previous point released;
+    a lone run gets a virgin arena. 656 B rows read 34.4 GB/s in a fresh process
+    and 27.9-28.5 GB/s as a rung, reproducibly, with every flag identical -- so
+    "which number is real" is a question about process history, not about the
+    copy, and it deserves a knob instead of a footnote.
+
+    Churned before the case is set up, so the measurement that follows takes the
+    same code path as always. Meaningful with --isolate-points: without it the
+    churn of point k stays in the process for point k+1.
+    """
+    if gib <= 0:
+        return
+    try:
+        phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        phys = 0
+    if phys:
+        budget = int(0.6 * phys / 2**30)
+        if gib > budget:
+            print(
+                f"note: --churn-gib {gib} clipped to {budget} GiB (60% of "
+                f"{phys / 2**30:.0f} GiB physical)",
+                file=sys.stderr,
+                flush=True,
+            )
+            gib = budget
+    done = _churn_bytes(gib << 30)
+    print(
+        f"note: churned {done / 2**30:.0f} GiB of pinned host memory before setup",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _plan_line(case: Case) -> str:
     """One line per space count: what the run will allocate and move."""
     pass_rows = case.spaces * case.rows
     dst_rows = pass_rows * case.dst_slack
+    churn = f", churn {case.churn_gib} GiB" if case.churn_gib else ""
     return (
         f"  {case.spaces:>3} space(s) x {case.src_total:>8} rows = "
         f"{case.total_pool_bytes / 2**30:>7.1f} GiB DDR, "
@@ -1549,6 +1677,7 @@ def _plan_line(case: Case) -> str:
         f"dst {dst_rows * case.row_bytes / 2**30:>6.2f} GiB "
         f"(x{case.dst_slack}), "
         f"tables {case.spaces * max(1, case.rotate) * case.rows * 4 / 2**20:>5.0f} MiB"
+        f"{churn}"
     )
 
 
@@ -1865,6 +1994,7 @@ def _case_argv(case: Case, args) -> list[str]:
         "--spaces", str(case.spaces),
         "--space-rows", str(case.src_total),
         "--dst-slack", str(case.dst_slack),
+        "--churn-gib", str(case.churn_gib),
         "--ckv-dim", str(case.ckv_dim),
         "--kpe-dim", str(case.kpe_dim),
         "--dtype", args.dtype,
@@ -1971,6 +2101,28 @@ def _run_isolated(points: list[tuple[str, Case]], args) -> tuple[list[dict], int
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    _SWEEP_OVERRIDES.clear()
+    if args.sweep_values:
+        if args.sweep == "none":
+            raise SystemExit(
+                "--sweep-values replaces a sweep's ladder, so it needs --sweep; "
+                "without one there is no ladder to replace"
+            )
+        # --sweep grid drives the space ladder, so its override is the space list.
+        name = "spaces" if args.sweep == "grid" else args.sweep
+        values = (
+            [t.strip() for t in args.sweep_values.split(",") if t.strip()]
+            if name == "src"
+            else _parse_int_list(args.sweep_values, "--sweep-values")
+        )
+        if not values:
+            raise SystemExit("--sweep-values is empty")
+        _SWEEP_OVERRIDES[name] = values
+        print(
+            f"note: the {name} ladder is overridden to {values}",
+            file=sys.stderr,
+            flush=True,
+        )
     if args.host_interleave and argv is None:
         if args.src != "host":
             print("note: --host-interleave only affects --src host", file=sys.stderr)
@@ -2027,6 +2179,7 @@ def main(argv=None) -> int:
         space_rows=space_rows if (args.space_rows or args.spaces > 1) else 0,
         dst_shared=args.dst_shared,
         dst_slack=args.dst_slack,
+        churn_gib=args.churn_gib,
     )
     row_bytes = base.row_bytes
     print(
@@ -2245,6 +2398,12 @@ def main(argv=None) -> int:
             case = Case(**{**base.__dict__, field: value})
             label = f"x{value}" if args.sweep == "spaces" else f"{args.sweep}={value}"
             points.append((label, case))
+    if args.sweep == "churn" and not args.isolate_points:
+        raise SystemExit(
+            "--sweep churn only means anything with --isolate-points: churn is not "
+            "undone, so in one process rung k would start from the sum of all "
+            "earlier rungs instead of from its own value"
+        )
     if args.sweep in ("spaces", "grid") and ladder_slack != args.dst_slack:
         # --sweep spaces builds its points in the generic branch above, which
         # copies the base case's already-resolved dst_slack; rewrite it so the
@@ -2336,6 +2495,10 @@ def main(argv=None) -> int:
             # A 24-point grid is mostly setup (200 GiB of pinned memory per
             # point), so the progress line says which point is paying for it.
             print(f"[{index}/{len(points)}] {label}", file=sys.stderr, flush=True)
+        # Outside the try: a churn that cannot allocate is a broken setup, not a
+        # measurement that failed, and it must stop the run rather than be
+        # recorded as a blank cell.
+        _churn_host(case.churn_gib)
         try:
             _guard_memory(case)
             bench = Bench(case)
