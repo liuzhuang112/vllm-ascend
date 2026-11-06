@@ -305,8 +305,9 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --verify --verify-rows 0 --rep
 | `--src-rows` | 源张量分配多少行（gather 池），默认 = `--rows`。`131072` + `--rows 4096` 就是真实 KV cache 形状：工作集比搬的载荷大 32 倍。支持乘积写法，`'131072*32'` = 4194304 | 4096 / 131072 |
 | `--spaces` | 独立源区域个数，**一次 launch 轮询一个**（默认 1 = 只有一个池，即旧行为）。生产形状是 78 个 cache 分区，每分区 `--space-rows` 行，每个分区搬 `--rows` 行，一个 pass 读完 78 个 | 1 / 2 / 4 / 8 / 16 / 32 / 64 / 78（`--sweep spaces`） |
 | `--space-rows` | 每个分区的行数，默认取 `--src-rows`、再不行取 `--rows`。生产是 `'131072*32'` = 4194304 行（32 请求 × 128K token） | `'131072*32'` |
-| `--dst-slack` | 目的端为"每行"分配几个槽位（散写程度）。`0` = 自动：单分区 4、多分区 1（78 × 196608 × 4 × 656 B 会是 37 GiB HBM，而载荷只有 9.4 GiB） | 0 / 1 / 4 |
+| `--dst-slack` | 目的端为"每行"分配几个槽位（散写程度）。`0` = 自动：单分区 4、多分区 1（78 × 196608 × 4 × 656 B 会是 37 GiB HBM，而载荷只有 9.4 GiB）。**这个 auto 值会让单体跑和阶梯里的一格不可比**，见下文"矩阵里的一个格子" | 0 / 1 / 2 / 4 / 8（`--sweep dst-slack`） |
 | `--dst-shared` | 所有分区写同一段目的端（覆盖写）。默认关闭：生产把 78 次 gather 拼起来，覆盖写会被 cache 吸收掉一部分流量 | 开关 |
+| `--isolate-points` | 每个扫描点单独起一个子进程测量（点之间不共享分配器状态），矩阵里的格子才等于单独跑同一条命令的结果；代价是每点一次解释器启动，`--isolate-timeout` 给单点超时（分钟） | 开关 |
 | `--dry-run` | 只打印分配规划（每分区字节数、总 DDR、表大小、pass 载荷）然后退出，不分配。配 `--sweep spaces` / `--sweep grid` 时逐点打印，跑 200~312 GiB 之前先看这个 | 开关 |
 | `--sweep grid` | 行长 × 分区数 的矩阵（默认 256/512/1024 B × 1/2/4/8/16/32/64/78 = 24 点），每点重新分配池 | 开关 |
 | `--grid-row-bytes` | 配合 `--sweep grid` 的行长列表，逗号分隔；加 656 就把生产行放进同一张矩阵 | `256,512,1024` / `256,512,656,1024` |
@@ -586,6 +587,58 @@ ladder 的第一级是唯一一个目标区大 4 倍、只覆盖 1/4 的点，�
 gather 是拼接，每个 dst 行写且只写一次），并打一行 note。所以这一列出现的
 "33.2 → 26.8" 是目标区布局的差，不是分区数的差 —— 重跑一次 1 个分区就能确认。
 
+#### 矩阵里的一个格子 ≠ 单独跑一条命令
+
+656 B 这一段最容易被问：同样的行数、同样的池，单独跑是 34.2 GB/s，在网格里却是 25.4 / 27.9：
+
+```bash
+# 单独跑（spaces 缺省 = 1，dst_slack 自动取 4）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows '131072*32' \
+    --kpe-dim 0 --dtype uint8 --src host --device 0 --ckv-dim 656      # 34.2 GB/s
+
+# 同一条命令作为网格里的 656 B × 1 分区那一格                       # 25.4 / 27.9 GB/s
+```
+
+这不是噪声：656 那一列在 2→78 上一直是 28.0~28.5，三次重跑 ±0.5%。差的是**测量条件**：
+
+| 差异 | 单独跑 | 网格里的一格 |
+|:---|:---|:---|
+| `--dst-slack` | auto = 4（492 MiB 目标区，只写 1/4） | 阶梯统一钉成 1（123 MiB，每行写一次） |
+| 进程状态 | 全新进程，此前只分配过这一段 2.56 GiB 锁页内存 | 第 17~24 个点，前面已经分配/释放过 80~300 GiB 锁页内存和 HBM |
+
+`--dst-slack` 可以单独排掉：第一次跑网格时 656 × 1 用的正是 auto=4，读数是 **25.4**，而不是 34.2。
+所以剩下的主要是**进程状态**——那 2.56 GiB 锁页源内存落在哪些 NUMA 节点上、还是不是一段干净的
+本节点内存。`--src host` 的价由锁页内存的物理位置决定，而这个量在一条阶梯里是逐点变化的，
+所以现在每个点会多打一行（并在 xlsx 里记一列 `src numa`），形如：
+
+```text
+                  src pages on N1 58% N0 42% of 123 MiB resident (4 KiB pages)
+```
+
+（只有 123 MiB 是常驻的，因为大池只给行表点到的那 196608 行写了 payload；这行报的就是它们的物理落点。）
+
+判据只有一句：**只有 `dst slack` 和 `src numa` 都相同的两点才能跨命令比较**。所以报一个数时把
+这两项（以及 `--isolate-points` / `--host-interleave` 的开关状态）一起写出来，否则 34.2 和 28 都是"真"的。
+
+两条让矩阵格子和单体跑等价的命令：
+
+```bash
+# a) 每点一个进程：点之间不共享分配器状态，格子 = 单独跑同一条命令
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows '131072*32' \
+    --kpe-dim 0 --dtype uint8 --src host --sweep grid --isolate-points --xlsx bench_iso.xlsx
+
+# b) 把"落在哪个节点"变成常量：锁页内存交错到两个 socket，也更接近生产（78 分区本来就跨 socket）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows '131072*32' \
+    --kpe-dim 0 --dtype uint8 --src host --host-interleave --sweep grid
+
+# c) 只想知道 dst 布局值多少（一行命令顶掉手动 4 次）
+python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --space-rows '131072*32' \
+    --kpe-dim 0 --dtype uint8 --src host --ckv-dim 656 --sweep dst-slack
+```
+
+想把"两列网格"跑成对照实验，就把行长顺次排进同一次运行：`--grid-row-bytes 1024,656` 里 656 是
+第二列，如果它从 34 掉到 28，掉的就不是行长度，而是进程状态。
+
 **行长才是这里的变量**（同一批数据的每行耗时）：
 
 | 行 B | ns/row @78 | 模型 | `%host` | 每 512 B 计费 | 判读 |
@@ -635,7 +688,7 @@ python benchmarks/kernel/scatter_copy_ub_bench.py --rows 196608 --spaces 8 --spa
 
 | sheet | 内容 |
 |:---|:---|
-| `结果` | 每个点一行，22 列：配置（行 B / 分区数 / 池行数 / bank / group / table）、`us`、`ns/row`、`GB/s`、`model GB/s`、`%host`、`pass ms`、`space min/max us`、`max/min`、池总量、dst 大小、`status`；冻结首行 + 自动筛选 |
+| `结果` | 每个点一行，24 列：配置（行 B / 分区数 / 池行数 / bank / group / table / **dst slack**）、`us`、`ns/row`、`GB/s`、`model GB/s`、`%host`、`pass ms`、`space min/max us`、`max/min`、池总量、dst 大小、**`src numa`**（源页落点）、`status`；冻结首行 + 自动筛选 |
 | `GBps` | **行长 × 分区数** 的吞吐矩阵，末列是单行模型预测 |
 | `nsrow` | 同一个矩阵，值是 `ns/row`。**比行长时先看这张**：GB/s 把行长折进了答案（256 B 的 25 GB/s 和 512 B 的 46 GB/s 差一倍，每行其实只差 10%） |
 | `pass_ms` | 同一个矩阵，值是 pass 时延（ms） |

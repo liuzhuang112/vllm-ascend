@@ -128,6 +128,7 @@ import os
 import shutil
 import socket
 import statistics
+import subprocess
 import sys
 from datetime import datetime
 from dataclasses import dataclass
@@ -793,6 +794,14 @@ class Bench:
             self._src_kv.append(dev)
             self._src_kv_cpu.append(cpu)
 
+        # Which nodes the pinned pages actually came from. A sweep cannot hold
+        # this fixed -- each point takes its buffer out of whatever the previous
+        # point released -- so it is recorded per point instead of assumed.
+        self.numa_hint = ""
+        if case.src == "host" and self._src_kv_cpu[0] is not None:
+            first = self._src_kv_cpu[0]
+            self.numa_hint = _numa_profile(first.data_ptr(), first.numel() * case.elem_size)
+
         dst_rows_per_space = rows * case.dst_slack
         n_dst = dst_rows_per_space if case.dst_shared else dst_rows_per_space * spaces
         self.dst_kv = torch.zeros(n_dst, case.ckv_dim, dtype=case.dtype, device=self.device)
@@ -1360,7 +1369,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--sweep",
         choices=(
             "none", "group-rows", "bank", "table-mode", "cores", "src", "ckv-dim",
-            "row-bytes", "src-rows", "rows", "spaces", "grid",
+            "row-bytes", "src-rows", "rows", "spaces", "dst-slack", "grid",
         ),
         default="none",
         help="iterate one knob instead of measuring a single point; 'grid' is the "
@@ -1378,6 +1387,23 @@ def parse_args(argv=None) -> argparse.Namespace:
         help="write every measured point to this .xlsx workbook: one row per point, "
         "plus a GB/s matrix and a pass-time matrix when the sweep covers two "
         "dimensions. Needs openpyxl; without it a .csv of the same rows is written",
+    )
+    parser.add_argument(
+        "--isolate-points",
+        action="store_true",
+        help="measure every sweep point in its own child process. A sweep otherwise "
+        "reuses one process, so rung k is measured on memory an earlier point "
+        "already allocated and freed: 656 B rows read 34.2 GB/s as a lone run and "
+        "25-28 GB/s as the 17th point of a grid. Isolating makes a rung mean what a "
+        "standalone run of the same flags means, at one interpreter start per point",
+    )
+    parser.add_argument(
+        "--isolate-timeout",
+        type=int,
+        default=60,
+        metavar="MIN",
+        help="per-point timeout for --isolate-points, in minutes (a 78-space point "
+        "allocates 200 GiB of pinned memory, so this is not a tight bound)",
     )
     return parser.parse_args(argv)
 
@@ -1409,6 +1435,13 @@ def sweep_values(name: str) -> list:
         # only way to tell "DDR got bigger and slower" from "the pool does not
         # matter at all", and it must be run with --table-mode 1.
         "src-rows": [4096, 16384, 32768, 65536, 131072],
+        # Destination rows per copied row. 1 = every destination row is written
+        # exactly once, which is what production does when it concatenates the
+        # per-partition gathers; 4 = the writes are a random quarter of a 4x
+        # larger window. It is the one knob a single-point run resolves
+        # differently from a ladder (auto: 4 with one space, 1 with many), so a
+        # standalone number and a matrix cell only compare when this is equal.
+        "dst-slack": [1, 2, 4, 8],
         # How many independent DDR partitions take part in one pass. Production
         # polls 78 of them; 1 is the control (a single base pointer, one
         # contiguous region). --space-rows is held fixed, so total DDR grows with
@@ -1427,6 +1460,61 @@ GRID_ROW_BYTES = (256, 512, 1024)
 # A sweep name is normally the field name with dashes flattened; --src-rows is
 # the source pool, which lives in Case.pool_rows.
 SWEEP_FIELDS = {"src-rows": "pool_rows"}
+
+
+def _numa_profile(ptr: int, size: int) -> str:
+    """Where the *resident* pages of [ptr, ptr+size) physically live, per NUMA node.
+
+    This is the diagnostic for the one thing a host-sourced copy cannot control
+    from inside the op: a 2.6 GiB pinned buffer is faulted in by whichever node
+    the allocator happened to get the pages from, and the device reads it over
+    the UB port of the socket that owns those pages. A sweep that keeps one
+    process alive hands point k a buffer carved out of what point k-1 freed, so
+    "the same copy" can run 20% slower for a reason that is not in the flags.
+
+    ``""`` when /proc/self/numa_maps is missing (non-Linux), the range has no
+    resident pages yet, or nothing overlaps it.
+    """
+    try:
+        with open("/proc/self/numa_maps", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return ""
+    lo, hi = ptr, ptr + size
+    pages: dict[int, int] = {}
+    page_kb = 4
+    for line in lines:
+        field = line.split()
+        if len(field) < 3:
+            continue
+        try:
+            # The first field is "start-end" in hex, not a bare address.
+            start_hex, _, end_hex = field[0].partition("-")
+            start, end = int(start_hex, 16), int(end_hex, 16)
+        except ValueError:
+            continue
+        overlap = min(hi, end) - max(lo, start)
+        if overlap <= 0:
+            continue
+        # A pinned buffer is normally one VMA per space, so this weight is 1;
+        # it only matters if the allocator hands back a range inside a bigger
+        # mapping, where counting the whole VMA would overstate the footprint.
+        weight = overlap / max(1, end - start)
+        for token in field[2:]:
+            if token.startswith("kernelpagesize_kB="):
+                page_kb = int(token.split("=", 1)[1] or page_kb)
+            elif token.startswith("N") and "=" in token:
+                node, _, count = token[1:].partition("=")
+                if node.isdigit() and count.isdigit():
+                    pages[int(node)] = pages.get(int(node), 0) + round(int(count) * weight)
+    if not pages:
+        return ""
+    total = sum(pages.values())
+    share = " ".join(
+        f"N{node} {100.0 * count / total:.0f}%"
+        for node, count in sorted(pages.items(), key=lambda kv: -kv[1])
+    )
+    return f"{share} of {total * page_kb / 2**10:.0f} MiB resident ({page_kb} KiB pages)"
 
 
 def _guard_memory(case: Case) -> None:
@@ -1534,11 +1622,11 @@ def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
     ws.auto_filter.ref = f"A1:{get_column_letter(len(RESULT_COLUMNS))}{ws.max_row}"
     width = {
         "case": 16, "row B": 8, "spaces": 8, "pool rows": 12, "launch MiB": 11,
-        "src": 6, "banks": 7, "group": 7, "tbl": 6, "cores": 7, "us": 10,
+        "src": 6, "banks": 7, "group": 7, "tbl": 6, "dst slack": 9, "cores": 7, "us": 10,
         "ns/row": 9, "GB/s": 9, "model GB/s": 12, "%host": 8, "pass ms": 11,
         "space min us": 13,
         "space max us": 13, "max/min": 9, "total DDR GiB": 14, "dst MiB": 10,
-        "status": 10,
+        "src numa": 34, "status": 10,
     }
     for i, col in enumerate(RESULT_COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width.get(col, 11)
@@ -1606,6 +1694,7 @@ def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
         ("run_len", meta.get("run_len", "")),
         ("rotate", meta.get("rotate", "")),
         ("计时", meta.get("timing", "")),
+        ("isolate", meta.get("isolate", "off")),
         ("", ""),
         ("GB/s", "rows x B/row / 时延，只算有效载荷；读一份 + 写一份的实际链路带宽约为 2 倍"),
         ("ns/row", "每行耗时，与行长无关的比较口径。GB/s 把行长折进了答案：256 B 的 25 GB/s "
@@ -1621,6 +1710,12 @@ def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
         ("dst_slack", "目的行数 / 拷贝行数。auto 是 1 个 space 用 4、多个 space 用 1；"
                       "spaces/grid 扫描时整条阶梯统一钉成 1，否则 1-space 那一点的目标区"
                       "比其余点大 4 倍，阶梯的第一级会同时变两个变量"),
+        ("src numa", "源（锁页）内存的常驻页落在哪些 NUMA 节点，以及常驻了多少。"
+                     "同一个 copy 换一个进程就能差 20%，差的就是这一列：扫一条 78 分区的阶梯"
+                     "要在同一个进程里反复分配/释放上百 GiB 锁页内存，后面几个点的源往往已经"
+                     "不是干净的一段本节点内存。想比较两条不同命令的结果，先看这一列是否一致"),
+        ("isolate", "--isolate-points 时为 on：每个点单独起一个进程，点与点之间不共享"
+                    "分配器状态，矩阵里的格子才等于单独跑同一条命令的结果"),
     ]
     for k, v in rows:
         ws.append([k, v])
@@ -1636,10 +1731,242 @@ def _write_workbook(path: str, records: list[dict], meta: dict) -> None:
 
 RESULT_COLUMNS = [
     "case", "row B", "spaces", "pool rows", "launch MiB", "src", "banks", "group",
-    "tbl", "cores", "us", "ns/row", "GB/s", "model GB/s", "%host", "pass ms",
-    "space min us", "space max us", "max/min", "total DDR GiB", "dst MiB", "status",
+    "tbl", "dst slack", "cores", "us", "ns/row", "GB/s", "model GB/s", "%host",
+    "pass ms", "space min us", "space max us", "max/min", "total DDR GiB", "dst MiB",
+    "src numa", "status",
 ]
 
+
+
+def _measure_and_report(bench: Bench, case: Case, args, label: str) -> dict:
+    """One point: verify if asked, time it, and print the row the table shows.
+
+    Shared by the in-process loop and by --isolate-points, so a rung of a sweep
+    is measured by exactly the code that measures a standalone run -- the only
+    difference is what else the process has allocated.
+    """
+    if args.verify:
+        bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
+    us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
+    gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
+    # One pass = every space once. A single pass is also the only place
+    # the spread between spaces shows up, and a 78-way mean would hide a
+    # region that is slow for a reason of its own (NUMA placement, a
+    # deeper page-table walk). Two passes: the first warms the walk.
+    per_space: list[float] = []
+    if case.spaces > 1:
+        bench.time_spaces()
+        per_space = bench.time_spaces()
+    model = predict_gbps(case.row_bytes, case.group_rows, case.rows)
+    lo = min(per_space) if per_space else None
+    hi = max(per_space) if per_space else None
+    dst_rows = case.rows * case.dst_slack * (1 if case.dst_shared else case.spaces)
+    rec = {
+        "case": label,
+        "row B": case.row_bytes,
+        "spaces": case.spaces,
+        "pool rows": case.src_total,
+        "launch MiB": case.rows * case.row_bytes / 2**20,
+        "src": case.src,
+        "banks": case.bank,
+        "group": case.group_rows,
+        "tbl": case.table_mode,
+        "dst slack": case.dst_slack,
+        "cores": case.cores,
+        "us": us_min,
+        "ns/row": us_min * 1000.0 / case.rows,
+        "GB/s": gbps,
+        "model GB/s": model,
+        "%host": 100.0 * gbps / model,
+        "pass ms": us_min * case.spaces / 1000.0,
+        "space min us": lo,
+        "space max us": hi,
+        "max/min": (hi / lo) if (lo and hi) else None,
+        "total DDR GiB": case.total_pool_bytes / 2**30,
+        "dst MiB": dst_rows * case.row_bytes / 2**20,
+        "src numa": bench.numa_hint,
+        "status": "ok",
+    }
+    if args.json:
+        # One record per point on stdout, nothing else, so a driver script
+        # (host_link_scale.py, or this script's own --isolate-points) can
+        # aggregate several processes. "rec" is the same row the xlsx holds.
+        print(
+            json.dumps(
+                {
+                    "label": label,
+                    "src": case.src,
+                    "device": case.device,
+                    "rows": case.rows,
+                    "src_rows": case.src_total,
+                    "spaces": case.spaces,
+                    "space_rows": case.src_total,
+                    "total_pool_bytes": case.total_pool_bytes,
+                    "dst_shared": case.dst_shared,
+                    "dst_slack": case.dst_slack,
+                    "pool_bytes": case.src_total * case.row_bytes,
+                    "row_bytes": case.row_bytes,
+                    "dtype": args.dtype,
+                    "ckv_dim": case.ckv_dim,
+                    "kpe_dim": case.kpe_dim,
+                    "group_rows": case.group_rows,
+                    "run_len": case.run_len,
+                    "rotate": case.rotate,
+                    "bank": case.bank,
+                    "table_mode": case.table_mode,
+                    "cores": case.cores,
+                    "us": us_min,
+                    "us_median": us_med,
+                    "ns_per_row": us_min * 1000.0 / case.rows,
+                    "gbps": gbps,
+                    "pass_us": us_min * case.spaces,
+                    "space_us_min": lo,
+                    "space_us_max": hi,
+                    "src_numa": bench.numa_hint,
+                    "status": "ok",
+                    "host_model_gbps": model,
+                    "rec": rec,
+                }
+            ),
+            flush=True,
+        )
+        return rec
+    # ns/row is the number that matters when comparing row lengths:
+    # GB/s hides the fact that the DMA is charged in 256 B granules.
+    # %host is measured / host-path model at this row length, group
+    # size and row count: ~100 means the run lands on the model, well
+    # below 100 means it pays for a merge it never got (the whole group
+    # is all-or-nothing, so run_len=1 never merges), and far above 100
+    # means the source is not crossing the host link (--src npu).
+    print(
+        f"{label:>18} {case.rows:>7} {case.spaces:>3} {case.src_total:>7} "
+        f"{case.row_bytes:>6} {case.group_rows:>5} "
+        f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
+        f"{us_min:>9.1f} {us_min * 1000.0 / case.rows:>7.1f} {gbps:>8.1f} "
+        f"{100.0 * gbps / model:>5.0f}"
+    )
+    if us_med != us_min:
+        print(f"{'':>18} median {us_med:.1f} us")
+    if per_space:
+        print(
+            f"{'':>18} pass {case.spaces} x {us_min:.1f} us = "
+            f"{us_min * case.spaces / 1000.0:.2f} ms; per-space "
+            f"{lo:.1f}..{hi:.1f} us (max/min {hi / lo:.3f})"
+        )
+    if bench.numa_hint:
+        print(f"{'':>18} src pages on {bench.numa_hint}")
+    return rec
+
+
+def _case_argv(case: Case, args) -> list[str]:
+    """The flags that reproduce exactly one Case, for --isolate-points."""
+    argv = [
+        "--rows", str(case.rows),
+        "--spaces", str(case.spaces),
+        "--space-rows", str(case.src_total),
+        "--dst-slack", str(case.dst_slack),
+        "--ckv-dim", str(case.ckv_dim),
+        "--kpe-dim", str(case.kpe_dim),
+        "--dtype", args.dtype,
+        "--src", case.src,
+        "--device", str(case.device),
+        "--bank", str(case.bank),
+        "--group-rows", str(case.group_rows),
+        "--table-mode", str(case.table_mode),
+        "--cores", str(case.cores),
+        "--run-len", str(case.run_len),
+        "--rotate", str(case.rotate),
+        "--warmup", str(args.warmup),
+        "--iters", str(args.iters),
+        "--rounds", str(args.rounds),
+        "--verify-rows", str(args.verify_rows),
+        "--repeat-verify", str(args.repeat_verify),
+        "--sweep", "none",
+        "--json",
+    ]
+    if case.dst_shared:
+        argv.append("--dst-shared")
+    if args.verify:
+        argv.append("--verify")
+    if args.host_interleave:
+        argv.append("--host-interleave")
+    return argv
+
+
+def _run_isolated(points: list[tuple[str, Case]], args) -> tuple[list[dict], int]:
+    """Measure every point in a fresh process, and keep its record.
+
+    A sweep reuses one interpreter, so rung k inherits the pinned arena of every
+    point before it. That is not a detail: 656 B rows read 25.4-28.5 GB/s as a
+    rung of a 4 x 8 grid and 34.2 GB/s as a one-point run of the same flags,
+    reproducibly, in both directions. Paying one interpreter start per point is
+    what makes a matrix cell mean the same thing as the single command it will
+    be held up against.
+    """
+    script = os.path.abspath(__file__)
+    records: list[dict] = []
+    failures = 0
+    for index, (label, case) in enumerate(points, start=1):
+        print(f"[{index}/{len(points)}] {label} (isolated)", file=sys.stderr, flush=True)
+        try:
+            proc = subprocess.run(
+                [sys.executable, script, *_case_argv(case, args)],
+                capture_output=True,
+                text=True,
+                timeout=args.isolate_timeout * 60,
+            )
+        except subprocess.TimeoutExpired:
+            failures += 1
+            print(f"{label:>18} isolated run timed out", flush=True)
+            records.append(
+                {
+                    "case": label,
+                    "row B": case.row_bytes,
+                    "spaces": case.spaces,
+                    "status": "isolated run timed out",
+                }
+            )
+            continue
+        if proc.stderr:
+            sys.stderr.write(proc.stderr)
+            sys.stderr.flush()
+        rec = None
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload.get("rec"), dict):
+                rec = payload["rec"]
+        if proc.returncode != 0 or rec is None:
+            failures += 1
+            tail = (proc.stdout.strip().splitlines() or ["no output"])[-1][:300]
+            print(f"{label:>18} isolated run failed rc={proc.returncode}: {tail}", flush=True)
+            records.append(
+                {
+                    "case": label,
+                    "row B": case.row_bytes,
+                    "spaces": case.spaces,
+                    "status": f"isolated run failed rc={proc.returncode}",
+                }
+            )
+            continue
+        rec["case"] = label
+        records.append(rec)
+        if args.json:
+            print(json.dumps(rec), flush=True)
+        else:
+            print(
+                f"{label:>18} {case.rows:>7} {case.spaces:>3} {case.src_total:>7} "
+                f"{case.row_bytes:>6} {case.group_rows:>5} "
+                f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
+                f"{rec['us']:>9.1f} {rec['ns/row']:>7.1f} {rec['GB/s']:>8.1f} "
+                f"{rec['%host']:>5.0f}"
+            )
+    return records, failures
 
 
 def main(argv=None) -> int:
@@ -1829,6 +2156,18 @@ def main(argv=None) -> int:
         )
         return 0
     print(dma_cost_hint(row_bytes, base.group_rows, base.rows), file=sys.stderr, flush=True)
+    if args.dst_slack <= 0 and args.sweep in ("none", "src", "rows", "ckv-dim", "row-bytes"):
+        # The one knob whose default depends on the point: a lone run gets a 4x
+        # destination, every rung of a spaces/grid ladder gets 1x. Two runs that
+        # differ only in this are not the same measurement.
+        print(
+            f"note: --dst-slack is auto -> {base.dst_slack} destination rows per copied row "
+            f"({base.rows * base.dst_slack * base.row_bytes / 2**20:.0f} MiB, only "
+            f"1/{base.dst_slack} of it written). A --sweep spaces/grid point uses 1, so pass "
+            "--dst-slack 1 (or 4) to both when comparing a single run with a matrix cell",
+            file=sys.stderr,
+            flush=True,
+        )
     if base.src == "npu":
         print(
             "note: the model above is fitted on --src host. On --src npu the same row runs "
@@ -1921,6 +2260,20 @@ def main(argv=None) -> int:
             file=sys.stderr,
             flush=True,
         )
+    if args.sweep == "dst-slack":
+        biggest = max(sweep_values("dst-slack"))
+        dst_bytes = (
+            base.rows * biggest * base.row_bytes * (1 if base.dst_shared else base.spaces)
+        )
+        print(
+            f"note: --sweep dst-slack spreads the writes over slack x --rows destination "
+            f"rows, so at slack {biggest} this allocates {dst_bytes / 2**30:.1f} GiB of HBM "
+            f"for {base.rows * base.row_bytes / 2**20:.0f} MiB of payload; slack 1 is the "
+            "production shape (the per-partition gathers are concatenated, every row "
+            "written exactly once)",
+            file=sys.stderr,
+            flush=True,
+        )
     if args.sweep == "grid" and args.spaces != 1:
         print(
             f"note: --sweep grid drives its own space counts, --spaces {args.spaces} is ignored",
@@ -1965,6 +2318,18 @@ def main(argv=None) -> int:
 
     records: list[dict] = []
     failures = 0
+    if args.isolate_points and len(points) > 1:
+        # Every point is measured by _measure_and_report in a process of its own,
+        # so `points` is consumed here instead of by the loop below. A single
+        # point needs no isolation: it already *is* the standalone run.
+        print(
+            f"isolate: {len(points)} point(s), one process each "
+            f"(timeout {args.isolate_timeout} min/point)",
+            file=sys.stderr,
+            flush=True,
+        )
+        records, failures = _run_isolated(points, args)
+        points = []
     multi = len(points) > 1
     for index, (label, case) in enumerate(points, start=1):
         if multi:
@@ -1987,109 +2352,8 @@ def main(argv=None) -> int:
             )
             continue
         try:
-            if args.verify:
-                bench.verify(sample=args.verify_rows, repeats=max(1, args.repeat_verify))
-            us_min, us_med = time_case(bench, args.warmup, args.iters, args.rounds)
-            gbps = bench.bytes() / (us_min * 1e-6) / 1e9 if us_min > 0 else 0.0
-            # One pass = every space once. A single pass is also the only place
-            # the spread between spaces shows up, and a 78-way mean would hide a
-            # region that is slow for a reason of its own (NUMA placement, a
-            # deeper page-table walk). Two passes: the first warms the walk.
-            per_space: list[float] = []
-            if case.spaces > 1:
-                bench.time_spaces()
-                per_space = bench.time_spaces()
-            model = predict_gbps(case.row_bytes, case.group_rows, case.rows)
-            lo = min(per_space) if per_space else None
-            hi = max(per_space) if per_space else None
-            dst_rows = case.rows * case.dst_slack * (1 if case.dst_shared else case.spaces)
-            rec = {
-                "case": label,
-                "row B": case.row_bytes,
-                "spaces": case.spaces,
-                "pool rows": case.src_total,
-                "launch MiB": case.rows * case.row_bytes / 2**20,
-                "src": case.src,
-                "banks": case.bank,
-                "group": case.group_rows,
-                "tbl": case.table_mode,
-                "cores": case.cores,
-                "us": us_min,
-                "ns/row": us_min * 1000.0 / case.rows,
-                "GB/s": gbps,
-                "model GB/s": model,
-                "%host": 100.0 * gbps / model,
-                "pass ms": us_min * case.spaces / 1000.0,
-                "space min us": lo,
-                "space max us": hi,
-                "max/min": (hi / lo) if (lo and hi) else None,
-                "total DDR GiB": case.total_pool_bytes / 2**30,
-                "dst MiB": dst_rows * case.row_bytes / 2**20,
-                "status": "ok",
-            }
+            rec = _measure_and_report(bench, case, args, label)
             records.append(rec)
-            if args.json:
-                # One record per point on stdout, nothing else, so a driver script
-                # (host_link_scale.py) can aggregate several processes.
-                print(
-                    json.dumps(
-                        {
-                            "label": label,
-                            "src": case.src,
-                            "device": case.device,
-                            "rows": case.rows,
-                            "src_rows": case.src_total,
-                            "spaces": case.spaces,
-                            "space_rows": case.src_total,
-                            "total_pool_bytes": case.total_pool_bytes,
-                            "dst_shared": case.dst_shared,
-                            "pool_bytes": case.src_total * case.row_bytes,
-                            "row_bytes": case.row_bytes,
-                            "dtype": args.dtype,
-                            "ckv_dim": case.ckv_dim,
-                            "kpe_dim": case.kpe_dim,
-                            "group_rows": case.group_rows,
-                            "run_len": case.run_len,
-                            "rotate": case.rotate,
-                            "bank": case.bank,
-                            "table_mode": case.table_mode,
-                            "cores": case.cores,
-                            "us": us_min,
-                            "us_median": us_med,
-                            "ns_per_row": us_min * 1000.0 / case.rows,
-                            "gbps": gbps,
-                            "pass_us": us_min * case.spaces,
-                            "space_us_min": lo,
-                            "space_us_max": hi,
-                            "status": "ok",
-                            "host_model_gbps": model,
-                        }
-                    ),
-                    flush=True,
-                )
-            else:
-                # ns/row is the number that matters when comparing row lengths:
-                # GB/s hides the fact that the DMA is charged in 256 B granules.
-                # %host is measured / host-path model at this row length, group
-                # size and row count: ~100 means the run lands on the model, well
-                # below 100 means it pays for a merge it never got (the whole group
-                # is all-or-nothing, so run_len=1 never merges), and far above 100
-                # means the source is not crossing the host link (--src npu).
-                print(
-                    f"{label:>18} {case.rows:>7} {case.spaces:>3} {case.src_total:>7} "
-                    f"{case.row_bytes:>6} {case.group_rows:>5} "
-                    f"{case.bank:>4} {case.table_mode:>3} {case.cores:>5} "
-                    f"{us_min:>9.1f} {us_min * 1000.0 / case.rows:>7.1f} {gbps:>8.1f} "
-                    f"{100.0 * gbps / model:>5.0f}"
-                )
-                if us_med != us_min:
-                    print(f"{'':>18} median {us_med:.1f} us")
-                if per_space:
-                    print(
-                        f"{'':>18} pass {case.spaces} x {us_min:.1f} us = "
-                        f"{us_min * case.spaces / 1000.0:.2f} ms; per-space "
-                        f"{lo:.1f}..{hi:.1f} us (max/min {hi / lo:.3f})"
-                    )
         except (Exception, SystemExit) as exc:  # keep the other points running
             failures += 1
             print(f"{label:>18} measurement failed: {exc}", flush=True)
@@ -2129,6 +2393,7 @@ def main(argv=None) -> int:
                 "run_len": args.run_len,
                 "rotate": args.rotate,
                 "timing": f"warmup {args.warmup}, iters {args.iters}, rounds {args.rounds}",
+                "isolate": "on" if args.isolate_points else "off",
             },
         )
     if failures:
